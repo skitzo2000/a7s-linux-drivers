@@ -1,0 +1,32 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * A7S cyberdeck — silence the sunxi DRM eDP/DP HPD log spam.
+ *
+ * The built-in sunxi DRM binds edp0@5720000 (DP-over-USB-C combo-PHY) and runs
+ * an HPD poll thread that logs "sunxi:sunxidrm:[INFO]: [EDP_INFO]: ..." at
+ * KERN_INFO ~20x/second (27k+ per boot). journald captures it all from
+ * /dev/kmsg — it wastes CPU/IO and DROWNS real crash traces (it hid the AIC8800
+ * radio-hang signature). The deck's display is the fbtft ILI9341 SPI panel
+ * (fb0), NOT card0, and DP-over-USB-C is a known-dead BSP AUX path anyway
+ * (kernel/dp-debug/DP-DEBUG.md). So we disable edp0 outright.
+ *
+ * Targets by node PATH (no exported label needed). Verified present in the live
+ * 6.18-edge DT: /soc@3000000/edp0@5720000.
+ *
+ * Build:   dtc -I dts -O dtb -o sun60i-a733-cyberdeck-noedp.dtbo <this>
+ * Install: /boot/dtb/allwinner/overlay/ + add "cyberdeck-noedp" to
+ *          overlays= in /boot/armbianEnv.txt (alongside cyberdeck-shield); reboot.
+ */
+
+/ {
+	compatible = "allwinner,sun60iw2";
+
+	fragment@0 {
+		target-path = "/soc@3000000/edp0@5720000";
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+};

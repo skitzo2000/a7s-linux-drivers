@@ -1,0 +1,272 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * A7S cyberdeck backplane shield — TFT + touch + radio 1 on SPI1 (BRINGUP-V2.md Phase 4)
+ *
+ * Kernel: 6.18.19-edge-sun60iw2 (BSP-dialect DT: spi_sunxi_ng, sun60iw2 pinctrl).
+ * Pin facts (BACKPLANE-DESIGN.md §2/§4.1, verified against pinctrl-sun60iw2.c):
+ *   SPI1 CLK/MOSI/MISO = PD11/PD12/PD13 (mux 6 "spi1"); every CS as GPIO.
+ *   TFT: CS=PD10 DC=PD14 RST=PB2 BL=PB6 (ILI9341, write-only, SDO NC).
+ *   Touch: CS=PM3 IRQ=PM4 (XPT2046 = ads7846-compatible; PM bank is on r_pio).
+ *   Radio 1 (J5, "8+1" socket in nRF24 pin order): CS=PJ24 (J5.4). The two flex
+ *   pins are the module's interrupt/data lines — for a CC1101 that is
+ *   GDO0=PB3 (J5.3, FLEXA) and GDO2=PJ25 (J5.8, FLEXB). Both are left as plain
+ *   GPIOs: spidev carries the register traffic and userspace reads the flex pins
+ *   through gpiod, so swapping a CC1101 for an nRF24/CC2500 is a userspace change.
+ *   Radio 2 (J6, identical socket): CS=PB7 (J6.4), GDO0=PB8 (J6.3, FLEXA),
+ *   GDO2=PG0 (J6.8, FLEXB) — all three confirmed on the running board by
+ *   forcing each pin's internal pull both ways: with a module seated, J6.3/J6.8
+ *   stop following the bias while every other spare pin still does.
+ * Radio power is NOT software-gated. SCHEMATIC.md §4 and BACKPLANE-DESIGN.md §5
+ * describe an AP2112K LDO and a PB4-gated TPS22918 load switch; neither was
+ * built. Per the netlist source of truth (a7s_backplane_skidl.py "NO LDO, NO
+ * load switch") and BRINGUP-V2.md, the sockets sit on +3V3 straight off the A7S
+ * header through polyfuse F2, and PB4 is a plain spare. So there is no regulator
+ * to declare here — but note F2 is the ONLY link to that rail, and a
+ * screen-first build is explicitly allowed to leave it unpopulated. An
+ * unpopulated F2 reads exactly like a dead module: 0x00/0xFF on MISO.
+ * GPIO cells are chip-relative banks: &pio B=1, D=3, J=9; &r_pio L=0, M=1.
+ * PJ=9 is not in the docs; it is confirmed from the running kernel's own
+ * gpiochip0 numbering (gpio-310 = PIN_5 = PJ22, so 310 = 9*32 + 22).
+ * reset-gpios ACTIVE_LOW per fbtft gpiod convention (logical 1 = reset asserted).
+ * Build:   dtc -@ -I dts -O dtb -o sun60i-a733-cyberdeck-shield.dtbo <this>
+ * Install: /boot/dtb/allwinner/overlay/ + "overlays=cyberdeck-shield" in armbianEnv.txt
+ */
+
+/ {
+	compatible = "allwinner,sun60iw2";
+
+	fragment@0 {
+		target = <&pio>;
+		__overlay__ {
+			spi1_shield_pins: spi1-shield-pins {
+				pins = "PD11", "PD12", "PD13";
+				function = "spi1";
+				drive-strength = <20>;
+			};
+		};
+	};
+
+	fragment@2 {
+		target = <&pio>;
+		__overlay__ {
+			uart2_shield_pins: uart2-shield-pins {
+				pins = "PB0", "PB1";	/* TX, RX only — PB2/PB3 belong to TFT/radio */
+				function = "uart2";
+				drive-strength = <10>;
+			};
+		};
+	};
+
+	fragment@3 {
+		target = <&uart2>;
+		__overlay__ {
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart2_shield_pins>;
+		};
+	};
+
+	/*
+	 * J12, the Flipper-Zero-compatible header — every routed pin made real.
+	 *
+	 * The socket is wired to the published Flipper pinout (verified against
+	 * docs.flipper.net: 1=+5V, 9=+3V3, 8/11/18=GND, 2/3/5=SPI MOSI/MISO/SCK,
+	 * 4=SPI CS, 13/14=UART TX/RX, 15/16=I2C SDA/SCL, 17=1-Wire), so the
+	 * ecosystem's modules physically fit. Fitting is not working: a pin only
+	 * works if the SoC end of it is switched on, and three of them were not.
+	 *
+	 * What the common add-ons actually need:
+	 *   NRF24 / external CC1101 / W5500 / SD  -> MOSI 2, MISO 3, *CS 4*, SCK 5,
+	 *       plus pin 6 as CE (nRF24) or GDO0 (CC1101)
+	 *   ESP32 & ESP8266 devboards, GPS, LoRa  -> UART on 13/14
+	 *   I2C sensors (HTU21D, SI7021, AM232x)  -> SDA 15, SCL 16
+	 *   iButton / DHT                         -> 1-Wire on 17
+	 *
+	 * So pin 4 becomes a real chip-select on the shared SPI bus (below), pins
+	 * 13/14 become uart3, and 15/16 become twi2. Pins 6, 7 and 17 stay plain
+	 * GPIOs on purpose — CE, GDO0 and 1-Wire are all userspace-driven, and a
+	 * driver claiming them would take them away from the app that needs them.
+	 *
+	 * Learned the hard way on the radio sockets: a module seated in a socket
+	 * whose chip-select the kernel does not drive reads 0x00 forever and looks
+	 * exactly like dead hardware.
+	 */
+
+	fragment@4 {
+		target = <&pio>;
+		__overlay__ {
+			/*
+			 * The two serial pins are biased DIFFERENTLY, and the asymmetry is
+			 * the whole point.
+			 *
+			 * furi_hal_serial.c pulls up both USART pins, and copying that
+			 * looked obviously right — but on this deck it is the difference
+			 * between a module that boots and one that does not. Across five
+			 * insertions, the only one where the GNSS module came out of reset
+			 * (its LED released) was the one where PJ23 had no bias at all.
+			 *
+			 * PJ23 is our RX, which means it is the *module's TX pin*, and on
+			 * many GNSS parts that pin doubles as a boot-mode strap sampled at
+			 * power-up. Holding it high while the module powers up latches a
+			 * different mode and it sits there mute. The Flipper gets away with
+			 * its pull-up because every one of its GPIOs has a 51R series
+			 * resistor in line (hardware docs) and ours do not — same config on
+			 * paper, different current into a strap pin.
+			 *
+			 * So: pull up our TX, because the module's receiver needs a defined
+			 * idle high and a floating RX reads as a permanent start bit. Leave
+			 * our RX alone, because that pin belongs to the module at power-up.
+			 */
+			uart3_tx_pins: uart3-tx-pins {
+				pins = "PJ22";		/* J12.13 - our TX, the module's RX */
+				function = "uart3";	/* mux 0x4 per pinctrl-sun60iw2.c */
+				drive-strength = <10>;
+				bias-pull-up;
+			};
+
+			uart3_rx_pins: uart3-rx-pins {
+				pins = "PJ23";		/* J12.14 - our RX, the module's TX/strap */
+				function = "uart3";
+				drive-strength = <10>;
+				bias-disable;
+			};
+
+			twi2_shield_pins: twi2-shield-pins {
+				pins = "PD16", "PD17";	/* J12.16 SCL, J12.15 SDA (also J1.28/J1.27) */
+				function = "twi2";	/* mux 0x6 per pinctrl-sun60iw2.c */
+				drive-strength = <10>;
+				bias-pull-up;		/* no external pull-ups on the shield */
+			};
+		};
+	};
+
+	fragment@5 {
+		target = <&uart3>;
+		__overlay__ {
+			/* The vendor DTS points uart3 at PI1/PI12; the backplane routes it
+			 * to PJ22/PJ23, so the pin group is overridden rather than reused.
+			 * No "sleep" state here: the shield header has no idle mode, and a
+			 * module mid-sentence should not have its pins muxed away. */
+			status = "okay";
+			pinctrl-names = "default";
+			pinctrl-0 = <&uart3_tx_pins>, <&uart3_rx_pins>;
+		};
+	};
+
+	fragment@6 {
+		target = <&i2c2>;
+		__overlay__ {
+			status = "okay";
+			clock-frequency = <400000>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&twi2_shield_pins>;
+		};
+	};
+
+	fragment@1 {
+		target = <&spi1>;
+		__overlay__ {
+			status = "okay";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&spi1_shield_pins>;
+			sunxi,spi-num-cs = <5>;
+			cs-gpios = <&pio 3 10 1>,	/* PD10 TFT_CS    active-low */
+				   <&r_pio 1 3 1>,	/* PM3  TOUCH_CS  active-low */
+				   <&pio 9 24 1>,	/* PJ24 RADIO1_CS active-low */
+				   <&pio 1 7 1>,	/* PB7  RADIO2_CS active-low */
+				   <&pio 6 3 1>;	/* PG3  FLIPPER_CS (J12.4) active-low */
+
+			tft@0 {
+				compatible = "ilitek,ili9341";
+				reg = <0>;
+				spi-max-frequency = <16000000>;
+				buswidth = <8>;
+				dc-gpios = <&pio 3 14 0>;	/* PD14 */
+				reset-gpios = <&pio 1 2 1>;	/* PB2, active-low */
+				led-gpios = <&pio 1 6 0>;	/* PB6 backlight */
+				rotate = <90>;			/* landscape; 270 was 180° out on the deck */
+				bgr;
+				fps = <30>;
+			};
+
+			touch@1 {
+				compatible = "ti,ads7846";
+				reg = <1>;
+				spi-max-frequency = <2000000>;
+				interrupt-parent = <&r_pio>;
+				interrupts = <1 4 2>;		/* PM4, falling edge */
+				pendown-gpio = <&r_pio 1 4 1>;	/* PENIRQ is active-LOW */
+				ti,swap-xy;
+				ti,x-min = /bits/ 16 <370>;
+				ti,x-max = /bits/ 16 <3600>;
+				ti,y-min = /bits/ 16 <300>;
+				ti,y-max = /bits/ 16 <3780>;
+				ti,x-plate-ohms = /bits/ 16 <200>;
+				ti,pressure-max = /bits/ 16 <15000>;
+				wakeup-source;
+			};
+
+			/*
+			 * BOTH radio sockets (J5, J6) as raw spidev nodes.
+			 *
+			 * J6 was missing here until 2026-08-03 and that cost a long
+			 * hunt: a CC1101 seated in J6 is invisible through
+			 * /dev/spidev1.2, which drives J5's chip-select, so the deck
+			 * read 0x00 forever and looked like a dead 3V3 rail. Declaring
+			 * only the socket we happened to test first is the bug —
+			 * either socket takes a module, so either socket gets a node.
+			 * (Proof it was never power: holding PB7 low by hand with
+			 * gpioset and re-running the identify returned PARTNUM=0x00
+			 * VERSION=0x14 MARCSTATE=0x01, and GDO0 was free-running
+			 * CLK_XOSC/192 the whole time.)
+			 *
+			 * No in-kernel driver: mainline has none for the CC1101, and the
+			 * out-of-tree ones pin you to a kernel version this deck rebuilds
+			 * often. Userspace (src/services/subghz.py) drives the registers
+			 * over spidev and reads GDO0/GDO2 through gpiod, which also means
+			 * the same node serves a CC2500 or an nRF24 with no DT change.
+			 *
+			 * "rohm,dh2228fv" is the conventional stand-in compatible that
+			 * binds spidev without the kernel's "buggy DT" warning.
+			 *
+			 * 5 MHz is inside the CC1101's 6.5 MHz burst-access limit with
+			 * margin for the socket stub. Note BACKPLANE-DESIGN.md §"radios
+			 * populated" advises holding the whole bus at ~8 MHz for MISO
+			 * integrity while the TFT node above runs at 16 MHz — left alone
+			 * for now because the panel is demonstrably stable with the module
+			 * seated, and halving panel throughput is the deck's frame budget.
+			 * If the display starts tearing or wedging with a radio fitted,
+			 * that TFT clock is the first thing to drop.
+			 */
+			radio1@2 {
+				compatible = "rohm,dh2228fv";
+				reg = <2>;
+				spi-max-frequency = <5000000>;
+			};
+
+			radio2@3 {
+				compatible = "rohm,dh2228fv";
+				reg = <3>;
+				spi-max-frequency = <5000000>;
+			};
+
+			/*
+			 * J12.4 — the chip-select every Flipper SPI add-on expects. An
+			 * nRF24, an external CC1101, a W5500 or an SD breakout all land
+			 * their CSN here, so it gets a spidev node like the radios do.
+			 * 4 MHz is the conservative floor across that set (nRF24 tolerates
+			 * 8, SD cards want more once initialised); userspace raises it per
+			 * device through SPI_IOC_WR_MAX_SPEED_HZ.
+			 */
+			flipper@4 {
+				compatible = "rohm,dh2228fv";
+				reg = <4>;
+				spi-max-frequency = <4000000>;
+			};
+		};
+	};
+};

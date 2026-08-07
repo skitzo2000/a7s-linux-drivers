@@ -1,0 +1,135 @@
+aic_btusb: free dropped skbs and stop the reader spinning on OOM
+
+Two defects in the vendor AIC8800 BT-over-USB transport that together turn a
+sustained HCI RX burst into an unrecoverable box hang.  Both are present in
+every AIC drop we have seen, including the newest (RELEASE_DATE
+2026_0123_5f7be68d, == radxa-pkg/aic8800 5.0+git20260123.5f7be68d-7), so
+upgrading the driver alone does not fix them.
+
+Context: aic_btusb does not use the kernel Bluetooth stack.  It keeps a
+private 500-entry ring (aic_skb_queue) filled from URB completion via
+hci_recv_frame() -> hci_send_to_stack(), and drained by a chardev read().
+
+1) aic_enqueue() leaks every dropped skb.
+   hci_send_to_stack() hands over a fresh pskb_copy() and never looks at it
+   again; hci_recv_frame() frees only the *original*.  When the ring is full
+   aic_enqueue() logs "Queue is full, entry will be dropped" and returns
+   without freeing, so the copy is leaked permanently -- one skb per packet,
+   for as long as the burst lasts.
+
+   The vendor's only backpressure (bypass_event()) drops BLE *advertising
+   reports* once the queue passes QUEUE_SIZE-100.  HID input reports arrive
+   as ACL data, not advertising reports, so a held key on a BT-HID keyboard
+   bypasses that guard entirely.
+
+   Fixed by freeing the dropped skb.  The free is deferred until after
+   spin_unlock_irqrestore() because aic_enqueue() runs from URB completion
+   with interrupts disabled, and the warning is rate-limited -- at flood rate
+   the unthrottled printk is itself a denial of service.
+
+2) btchr_read() spins at 100% CPU when aic_dequeue_try() fails.
+   On a partial read (deq_len < skb->len) aic_dequeue_try() returns
+   pskb_copy(..., GFP_ATOMIC), which can fail under memory pressure.  It then
+   returns NULL while leaving the entry queued.  btchr_read()'s
+   wait_event_interruptible(!is_queue_empty()) is still satisfied, so the
+   while (count) loop never sleeps and never exits -- a hard livelock in the
+   syscall, reached exactly when memory is already short.
+
+   Fixed by returning -ENOMEM instead of looping, letting userspace retry.
+
+Defect 1 exhausts memory; that makes defect 2 fire; the result is an
+unkillable spinning reader on an OOM box.  This is consistent with the
+observed failure (deck hard-hangs on a held BT keyboard key, SSH dies with
+it, watchdog reset ~16 s, no kernel trace) but that end-to-end link is
+inferred, not yet proven on hardware -- it needs a board run to confirm.
+
+Applies to: kernel/src/na-allwinner-bsp-618 (BSP graft tree), against the
+newer aic8800 drop carried on branches linux-6.18.x / linux-6.18.y.
+NOTE: the copy on our current branch (linux-6.18.z) is CRLF; the .x/.y copy
+is LF-normalised.  This patch targets the LF copy.
+
+Not-yet-tested-on: hardware (board offline at time of writing)
+
+--- a/drivers/net/wireless/aic8800/usb/aic_btusb/aic_btusb.c
++++ b/drivers/net/wireless/aic8800/usb/aic_btusb/aic_btusb.c
+@@ -29,6 +29,7 @@
+ #include <linux/sched.h>
+ #include <linux/errno.h>
+ #include <linux/skbuff.h>
++#include <linux/netdevice.h>
+ #include <linux/usb.h>
+ 
+ #include <linux/ioctl.h>
+@@ -698,18 +699,32 @@
+ static struct sk_buff *aic_skb_queue[QUEUE_SIZE];
+ static int aic_skb_queue_front = 0;
+ static int aic_skb_queue_rear = 0;
++static unsigned long aic_skb_queue_drop_cnt = 0;
++static unsigned long aic_skb_queue_drop_warn_j = 0;
+ 
+ static void aic_enqueue(struct sk_buff *skb)
+ {
+ 	unsigned long flags = 0;
+ 	
++	bool dropped = false;
++	unsigned long dropped_total = 0;
++
+ 	spin_lock_irqsave(&queue_lock, flags);
+     if (aic_skb_queue_front == (aic_skb_queue_rear + 1) % QUEUE_SIZE) {
+         /*
+          * If queue is full, current solution is to drop
+          * the following entries.
++         *
++         * The caller hands ownership of skb to us unconditionally (every
++         * call site passes a fresh pskb_copy()), so a dropped entry must be
++         * freed or it is leaked forever.  A sustained RX burst that outruns
++         * the chardev reader -- e.g. a held key on a BT-HID keyboard, or an
++         * advertising storm -- otherwise leaks one skb per packet until the
++         * machine dies.  Note the free is deferred to outside the lock: we
++         * are called from URB completion with interrupts disabled here.
+          */
+-        AICBT_WARN("%s: Queue is full, entry will be dropped", __func__);
++        dropped = true;
++        dropped_total = ++aic_skb_queue_drop_cnt;
+     } else {
+         aic_skb_queue[aic_skb_queue_rear] = skb;
+ 
+@@ -718,6 +733,17 @@
+ 
+     }
+ 	spin_unlock_irqrestore(&queue_lock, flags);
++
++	if (dropped) {
++		dev_kfree_skb_any(skb);
++		/*
++		 * Rate-limit the warning: at flood rate an unthrottled printk is
++		 * itself a denial of service.
++		 */
++		if (printk_timed_ratelimit(&aic_skb_queue_drop_warn_j, 5000))
++			AICBT_WARN("%s: Queue is full, entry dropped (total %lu)",
++			           __func__, dropped_total);
++	}
+ }
+ 
+ static struct sk_buff *aic_dequeue_try(unsigned int deq_len)
+@@ -1285,6 +1311,20 @@
+             kfree_skb(skb);
+             break;
+         }
++
++        /*
++         * aic_dequeue_try() returned NULL with a non-empty queue.  That
++         * means its partial-read pskb_copy(GFP_ATOMIC) failed, and since
++         * the wait_event condition (!is_queue_empty()) is still true this
++         * loop would spin at 100% CPU in the syscall forever -- precisely
++         * when the box is already short on memory.  Bail out instead and
++         * let userspace retry.
++         */
++        if (!is_queue_empty()) {
++            AICBT_ERR("%s: dequeue failed on non-empty queue, -ENOMEM", __func__);
++            ret = -ENOMEM;
++            break;
++        }
+     }
+ 
+     return ret;

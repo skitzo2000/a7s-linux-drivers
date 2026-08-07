@@ -1,0 +1,19 @@
+# kernel module build output
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.symvers
+*.order
+.*.cmd
+.tmp_versions/
+modules.builtin*
+
+# dtc output
+*.dtbo
+*.dtb
+
+# editor / os
+*~
+.DS_Store
