@@ -1,0 +1,120 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Radxa Cubie A7S — everything DisplayPort-over-USB-C needs from the device
+ * tree, in one overlay. Supersedes sun60i-a733-typec-dp-altmode-svid.dts and
+ * sun60i-a733-typec-dp-aux-bias.dts; load this instead of, not alongside,
+ * those two.
+ *
+ * The A7S has no HDMI. Every pixel leaves this board over USB-C DP alt mode,
+ * so both fixes below are on the only video path there is.
+ *
+ * ---- 1. DP alt-mode SVID is declared at the wrong width -------------------
+ *
+ * The BSP declares the connector's DP alt mode with a 32-bit cell:
+ *
+ *     altmodes {
+ *         altmode@0 {
+ *             reg  = <0x00>;
+ *             svid = <0xff01>;     // 4 bytes: 00 00 ff 01
+ *             vdo  = <0xffffffff>;
+ *         };
+ *     };
+ *
+ * On 6.18 the Type-C class parses that as a *16-bit* value —
+ * drivers/usb/typec/class.c, typec_port_register_altmodes():
+ *
+ *     u16 svid;
+ *     ret = fwnode_property_read_u16(child, "svid", &svid);
+ *
+ * of_property_read_u16() on a 4-byte big-endian property returns the FIRST two
+ * bytes, so svid comes back 0x0000 instead of 0xff01. (vdo survives because it
+ * is read with the u32 accessor, which is why only svid is wrong.)
+ *
+ * The port therefore registers DisplayPort under SVID 0x0000 while the sink
+ * advertises 0xff01, the two never match, and DP alt mode is never entered:
+ *
+ *     /sys/class/typec/port0/port0.0/svid        -> 0000   (want ff01)
+ *     /sys/class/typec/port0-partner/...0/active -> no
+ *
+ * The combo PHY then stays muxed to USB, no DP lanes are assigned, no HPD is
+ * asserted, and no AUX transaction is ever attempted. This sits upstream of
+ * every other DP fix — they are all unreachable until this one lands.
+ *
+ * /bits/ 16 emits a 2-byte property, which of_property_read_u16() reads
+ * correctly. This affects any A733 board on a recent kernel, not just the A7S.
+ *
+ * ---- 2. AUX DC-bias GPIOs are left unconnected ----------------------------
+ *
+ * DP AUX over USB-C is AC-coupled and needs a DC bias applied at the source so
+ * the sink recognises a valid AUX partner. Which line is pulled up and which
+ * down depends on cable orientation, because AUX+/AUX- land on SBU1/SBU2
+ * differently when the plug is flipped.
+ *
+ * On the A7S (schematic v1.10) that bias is two SoC GPIOs driving the DC side
+ * of the coupling caps:
+ *
+ *     AUXP -- C105 100nF -- SBU1        PL10 -- SBU1-DC   (10K / 100K bias)
+ *     AUXN -- C107 100nF -- SBU2        PL11 -- SBU2-DC
+ *
+ * sunxi-phy-switcher.c already implements the orientation swap:
+ *
+ *     case TYPEC_ORIENTATION_NORMAL:   auxp = AUX_PULL_DOWN, auxn = AUX_PULL_UP;
+ *     case TYPEC_ORIENTATION_REVERSE:  auxp = AUX_PULL_UP,   auxn = AUX_PULL_DOWN;
+ *
+ * ...but every branch is guarded by gpio_is_valid(), and the vendor DTS ships
+ * both properties commented out for this board:
+ *
+ *     // aux_p = <&r_pio PL 10 GPIO_ACTIVE_HIGH>;
+ *     // aux_n = <&r_pio PL 11 GPIO_ACTIVE_HIGH>;
+ *
+ * So the bias is never applied in either orientation and the AUX pair floats.
+ *
+ * These are consumer properties on phy_switcher@10 — the node whose driver
+ * looks them up. They are not GPIO controllers and must not be declared as
+ * such. r_pio bank numbering is chip-relative: L = 0, M = 1, so PL10 is
+ * <&r_pio 0 10 0>.
+ *
+ * NOTE: do NOT also uncomment `hotplug = <&pio PH 4 ...>` from the vendor DTS.
+ * On the A7S, PH4 is GMAC1_TXD1 — it belongs to ethernet, not DP. That is why
+ * Allwinner commented it out for this board, and claiming it breaks the GMAC.
+ * HPD arrives over CC as a VDM and reaches DRM through extcon; no GPIO is
+ * involved on this board.
+ *
+ * ---- build / install ------------------------------------------------------
+ *
+ *   dtc -@ -I dts -O dtb -o sun60i-a733-cubie-a7s-dp.dtbo sun60i-a733-cubie-a7s-dp.dts
+ *   sudo cp sun60i-a733-cubie-a7s-dp.dtbo /boot/dtb/allwinner/overlay/
+ *   # add "cubie-a7s-dp" to overlays= in /boot/armbianEnv.txt, then reboot
+ *
+ * -@ is required: both fragments resolve phandles against the base DTB's
+ * __symbols__ node.
+ *
+ * ---- verify ---------------------------------------------------------------
+ *
+ *   cat /sys/class/typec/port0/port0.0/svid      -> ff01
+ *   dmesg | grep aux_p                           -> no "get aux_p ... failed"
+ *   cat /sys/class/drm/card0-DP-1/status         -> connected
+ */
+
+/ {
+	compatible = "allwinner,sun60iw2";
+
+	/* DP alt-mode SVID, at the width the kernel actually reads. */
+	fragment@0 {
+		target-path = "/soc@3000000/i2c@7084000/husb311@4e/connector/altmodes/altmode@0";
+		__overlay__ {
+			svid = /bits/ 16 <0xff01>;
+		};
+	};
+
+	/* AUX DC-bias GPIOs, as consumer properties on the switcher. */
+	fragment@1 {
+		target-path = "/phy_switcher@10";
+		__overlay__ {
+			aux_p = <&r_pio 0 10 0>;	/* PL10 -> SBU1-DC */
+			aux_n = <&r_pio 0 11 0>;	/* PL11 -> SBU2-DC */
+		};
+	};
+};

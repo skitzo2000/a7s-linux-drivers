@@ -1,0 +1,71 @@
+phy: sunxi-cadence-combophy: gate the software HPD on the DP_STATUS HPD bit
+
+0104 added typec-dp-no-hpd for boards like the Cubie A7S that route no usable
+physical HPD, publishing the connection state through the DP extcon instead.
+It derived that state from the Alt Mode state alone:
+
+	hpd_state = state == TYPEC_DP_STATE_C || ... || TYPEC_DP_STATE_F;
+
+Being in a DP Alt Mode state means the mux is pointed at DP. It does not mean
+a sink is ready to answer. The sink reports that separately over CC in the
+DP_STATUS HPD bit, which the phy switcher already folds into bit 6 of the
+submode - the value this then overwrote.
+
+The two are not simultaneous. On the dock tested here the mux reaches
+STATE_DP_D with DP_STATUS 0x1a (HPD low) and the sink only asserts HPD ~230ms
+later at 0x9a. Publishing "connected" on the earlier event makes the eDP
+driver read DPCD from a sink that is not listening yet; AUX times out, DPCD is
+never parsed, and the link is trained from stale devicetree lane parameters.
+
+Require both conditions instead of overriding one with the other. This is the
+same connection authority mainline uses for DP alt mode, and it closes the
+race at its source rather than papering over it with a retry.
+
+Note this makes a sink that never sets DP_STATUS HPD stay disconnected, which
+is the correct behaviour but is stricter than 0104 was.
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+--- a/bsp/drivers/phy/sunxi-cadence-combophy.c
++++ b/bsp/drivers/phy/sunxi-cadence-combophy.c
+@@ -2504,17 +2504,31 @@
+ 		}
+ 
+ 		/*
+-		 * Cubie A7S Type-C DP has no usable physical HPD input.  Its Type-C
+-		 * controller has already established the DP Alt-Mode state, which is
+-		 * the connection authority for this opt-in board.  Do not alter the
+-		 * hardware HPD signal or controller registers; only publish the
+-		 * software connection state through the existing DP extcon.
++		 * Cubie A7S Type-C DP has no usable physical HPD input, so the
++		 * connection state has to be published in software through the DP
++		 * extcon rather than read off a pin. Never touch the hardware HPD
++		 * signal or the controller HPD registers on such a board.
++		 *
++		 * Being in a DP Alt Mode state is necessary for that but not
++		 * sufficient: it only says the mux is pointed at DP, not that a
++		 * sink is ready to answer. The sink reports readiness over CC in
++		 * the DP_STATUS HPD bit, which the switcher folds into bit 6 of
++		 * the submode, so require both.
++		 *
++		 * Treating the Alt Mode state alone as "connected" - which is what
++		 * this did - fires the extcon the instant the mux flips, typically
++		 * a couple of hundred milliseconds before the sink asserts HPD
++		 * (DP_STATUS 0x1a -> 0x9a on the dock tested here). The eDP driver
++		 * takes that as a plug event and immediately reads DPCD from a sink
++		 * that is not listening yet; AUX times out, DPCD is never parsed,
++		 * and the link is then trained from stale devicetree lane
++		 * parameters. Gating on HPD closes that race at its source.
+ 		 */
+ 		if (sunxi_cphy->typec_dp_no_hpd)
+-			hpd_state = state == TYPEC_DP_STATE_C ||
+-				    state == TYPEC_DP_STATE_D ||
+-				    state == TYPEC_DP_STATE_E ||
+-				    state == TYPEC_DP_STATE_F;
++			hpd_state = hpd_state && (state == TYPEC_DP_STATE_C ||
++						  state == TYPEC_DP_STATE_D ||
++						  state == TYPEC_DP_STATE_E ||
++						  state == TYPEC_DP_STATE_F);
+ 
+ 		if (combo0->hpd_state != hpd_state) {
+ 			if (sunxi_cphy->extcon)

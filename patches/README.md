@@ -1,74 +1,112 @@
-# patches — the DVFS reset fix
+# patches
 
-One patch, against the Allwinner BSP overlay tree. It's the fix for the single worst bug I hit on
-this board.
+Kernel patches against the Allwinner BSP tree (`NickAlilovic/allwinner-bsp`, branch
+`linux-6.18.z`, which mounts at `bsp/` inside the kernel source).
 
-## The A733 resets under load when cpufreq changes frequency
+`0001` is a power fix and stands alone. `0100`–`0110` are the DisplayPort-over-USB-C series and
+apply in order.
 
-Not at a particular frequency. Not at a particular voltage. Pin the clock anywhere you like —
-1508 MHz, 2 GHz, doesn't matter — and the board runs a full 8-core load for half an hour without
-blinking. Let `ondemand` change frequency under that same load and it hard-resets in minutes.
+## 0001 — AXP8191 stepped CPU-rail voltage
 
-That took a while to see, because every symptom pointed somewhere else. The ethernet "hang" was
-this. The under-load reboots were this. The thermal throttle taking the box down was this — a
-throttle *is* a frequency change.
+| Patch | What |
+|---|---|
+| `0001-axp8191-step-cpu-rail-voltage-transitions.patch` | Step the CPU rail in bounded increments instead of one jump |
 
-**How it was pinned down:** pinned the big cluster at 2 GHz and bumped dcdc3 from 1050 to 1120 mV
-by hand (`i2cset -f -y 0 0x36 0x14 0xbe`). The board survived load at both voltages, so it isn't
-static undervolt. Then the fixed-frequency soak survived where `ondemand` died. It's the
-transition.
+The A733 hard-resets under load when cpufreq changes frequency — not at any particular frequency
+or voltage. Pin the clock anywhere and the board runs a full 8-core load indefinitely; let
+`ondemand` move it under that same load and it resets in minutes. The ethernet "hangs", the
+under-load reboots and the thermal-throttle crashes were all this one bug (a throttle *is* a
+frequency change). Verified on-board.
 
-**The code bug:** the AXP8191's CPU rails (dcdc2/3/4) go through `AXP_DESC_RANGES_VOL_DELAY`,
-which writes the new selector in one shot. On this board that's up to a 250 mV jump — 800 to
-1050 mV on the A76 rail — in a single write, and the rail glitches getting there. The driver
-already has a stepped path for exactly this. It's gated behind
-`CONFIG_AW_AXP1530_WORKAROUND_DVM`, which is off, and the AXP8191 descriptors never used it
-anyway.
+## 0100–0110 — DisplayPort over USB-C
 
-**The fix:** ramp up-transitions ~50 mV at a time with a 250 µs settle between steps. Down-
-transitions can't undervolt, so those still go direct.
+**Status: working.** Cold boot with the cable already in, no debug knobs, no manual
+`echo detect`, survives reboot. Verified 2026-08-19 on a Pluggable UD-ULTC4K dock's native
+DP-alt output driving a 2560×1440 monitor.
 
-**Verified:** 10-minute soak of `ondemand` + full 8-core load + 2 GHz + crossing the 60 °C passive
-trip, so governor transitions and thermal transitions firing continuously. Zero resets, zero Oops.
-That's the exact condition that took the stock kernel down in under two minutes.
+| Patch | What |
+|---|---|
+| `0100-dp-combophy-dp-only-bringup-orientation-aux-pad.patch` | Bring the combo PHY up for the 4-lane DP-only pin C/E layout, latch orientation before the code that reads it, drive the AUX pad |
+| `0101-dp-trilinear-aux-clkdiv-and-pad-direction.patch` | `AUX_CLOCK_DIVIDER` is the APB clock in MHz (`clk_bus_edp` = 26), and AUX is half-duplex so the pad direction must be driven per transaction |
+| `0102-dp-edp-reinit-phy-before-aux-retry-and-quiet-detect.patch` | Recover the PHY and controller before an AUX retry; stop logging connector detect at info level (~27k lines/boot) |
+| `0103-dp-dts-a7s-enable-aux-dc-bias-gpios.patch` | Wire up the PL10/PL11 AUX DC-bias GPIOs the vendor DTS leaves commented out |
+| `0104-dp-a7s-typec-altmode-no-hpd-lifecycle.patch` | Opt-in lifecycle for boards with no usable physical HPD pin |
+| `0105-dp-force-phy-cycle-before-typec-aux-retry.patch` | The generic PHY core refcounts `init`/`power_on`, so `0102`'s recovery was a no-op — drop the bind reference first |
+| `0106-dp-trilinear-clear-stale-aux-interrupt-cause.patch` | `TR_INTERRUPT_CAUSE` latches and is read-to-clear; a stale `REPLY_TIMEOUT` failed the *next* request before it was sent. Also fixes a one-byte reply-FIFO overrun (`i <= len`) |
+| `0107-dp-edp-pin-assignment-aware-link-policy.patch` | Rewrite `edp_update_capacity()` as a real DP link policy maker: pin-assignment lane budget and bandwidth-aware rate, applied whether or not DPCD was read |
+| `0108-dp-edp-link-training-fallback.patch` | Bounded lane/rate step-down when training fails, instead of training once and giving up |
+| `0109-dp-combophy-gate-software-hpd-on-dp-status.patch` | Require the real `DP_STATUS` HPD bit, not just "are we in a DP alt mode state" — it was firing ~230 ms early |
+| `0110-dp-edp-adopt-already-connected-sink-at-bind.patch` | The sink extcon notifier is edge-only; read the level at bind so a cable already plugged at power-on is seen |
 
-## Applying it
+### What this turned up
 
-The regulator is `CONFIG_AW_REGULATOR_AXP2101=y` — built in, not a module. This needs a full Image
-rebuild.
+The DP **link policy** was skipped whenever the plug-time DPCD read failed:
 
-From the root of `radxa/allwinner-bsp` (branch `linux-6.18.x`), which mounts at `bsp/` in the
-kernel tree:
-
-```sh
-patch -p1 < 0001-axp8191-step-cpu-rail-voltage-transitions.patch
+```c
+if (drm_edp->dpcd_parsed && !edp_debug->lane_debug_en) {
+        lane_para->lane_cnt = min(src_cap->max_lane, sink_cap->max_lane);
+        lane_para->bit_rate = min(src_cap->max_rate, sink_cap->max_rate);
+}
 ```
 
-Back up `/boot/Image` before you swap it. If the new one doesn't boot you have no console to tell
-you why, and getting the card back out is the only way home.
+With no DPCD, `lane_para` kept the devicetree defaults — `edp_lane_cnt = <4>` — and the driver
+trained four lanes into a Type-C pin-D link that only has two wired. The two lanes that go
+nowhere never reach clock recovery, so the training loop walks the drive swing to its ceiling and
+dies with `swing voltage reach max level, training1(clock recovery training) fail`. The same
+guard is why the `src_max_lane_debug` sysfs attribute appeared to do nothing — it is read inside
+the branch being skipped.
 
-## Worth knowing before you build on this
+Several separate bugs conspired to make that DPCD read fail: the software HPD fired before the
+sink was ready (`0109`), a latched interrupt cause failed the request before it was sent
+(`0106`), and a cable present at power-on was never announced at all (`0110`).
 
-The BSP's "AXP8191" is the **AXP318W** — 9 DCDC and 28 LDO match exactly, and mainline U-Boot and
-a mainline regulator driver both landed under that name.
+Three more things worth knowing if you go digging in this IP:
 
-**DCDC2 and DCDC3 have hardware DVM.** The rail walks to target on its own at one step per
-15.625 µs or 31.25 µs, which is 640 or 320 mV/ms — both faster than this patch's 200 mV/ms. If you
-can find the enable bit, hardware DVM is strictly better than a software loop for those two rails,
-and DCDC4 is the only one that would still need the loop.
+- **AUX works.** Every receive-side counter reading zero points at the latched interrupt cause
+  above, not at the analog path.
+- **Sinks report their own lane count.** This dock advertises two lanes in `DPCD 0x002 = 0xc2`,
+  so `min(src, sink)` already lands on 2 — the pin-assignment budget in `0107` is what covers the
+  sinks that *don't*, such as a passive USB-C→DP adapter advertising four lanes on a pin-D link.
+- **`TR_PHY_STATUS == 0` proves nothing.** The A733 manual declares that register
+  implementation-defined and the vendor driver never uses it for control.
 
-I haven't found that bit. No AXP8191 DVM register exists in any vendor header, and
-`DCDC_MODE_CTL1–4` (0x1B–0x1E) read zero and are PWM/PFM only. The candidate is bit 7 on
-0x13–0x1A, which boot0 sets and the live board matches — but **don't probe it empirically**, those
-are live CPU rails. The mainline `regulator: axp20x` AXP318W series on lore.kernel.org should have
-the real answer.
+### Verifying
 
-If it turns out hardware DVM covers dcdc2/3, this patch shrinks to dcdc4 only. If it doesn't, the
-loop should at least get cheaper: `usleep_range` instead of `udelay`, and drop `.set_voltage_time`
-so the regulator core stops adding a second full ramp delay on top of ours.
+```sh
+cat /sys/class/drm/card0-DP-1/status                        # connected
+cat /sys/devices/virtual/edp/edp/attr/lane_config_now       # lane_para_use: user, lane_cnt: 2
+```
 
-## Related
+Training success is silent, so trust the registers (`/dev/mem`, `CONFIG_STRICT_DEVMEM` is off):
 
-`gmac/README.md` covers the other half of the instability — the cpuidle race that this patch
-doesn't touch. You want both: this patch for the transitions, deep-idle disabled for the race, and
-a fan so the thermal trip stops firing in the first place.
+| Register | Expected |
+|---|---|
+| `LANE_COUNT_SET` `0x5740004` | `0x2` — negotiated lane count |
+| `TRAINING_PATTERN_SET` `0x574000c` | `0x0` — training complete |
+| `LINK_BW_SET` `0x5740000` | `0x14` — 5.4 Gbps |
+| `MAIN_HRES` / `MAIN_VRES` `0x5740834` / `0x5740838` | the active mode |
+
+`tools/reg.py` reads these without hand-rolling `mmap`.
+
+### Applying
+
+These are delivered as Armbian userpatches. Drop them in
+`userpatches/kernel/archive/sun60iw2-edge/` and build:
+
+```sh
+./compile.sh kernel BOARD=radxa-cubie-a7s BRANCH=edge KERNEL_CONFIGURE=no PREFER_DOCKER=yes
+```
+
+`PREFER_DOCKER=yes` runs the build in the Armbian container and needs no host sudo. Note that
+`docker` and `kernel` are both framework commands, so `./compile.sh docker kernel …` fails. The
+`P<hash>` field in the output `.deb` names hashes the patch set — it is the quickest check that
+new patches were actually picked up.
+
+The DP path also needs the device-tree overlays in [`overlays/`](../overlays/); without the SVID
+one, DP alt mode is never entered at all.
+
+### Sink coverage
+
+Proven on Type-C **pin D** (2 lanes) via a dock's native DP-alt output. `0107` computes the lane
+budget from the negotiated pin assignment, so **pin C/E** (4 lanes) is handled by the same code
+path; more sinks are being brought through next.

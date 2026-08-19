@@ -1,0 +1,55 @@
+drm: trilinear_dp14: clear the stale AUX interrupt cause before each request
+
+TR_INTERRUPT_CAUSE is a latching, read-to-clear register, and nothing was
+clearing it. A REPLY_TIMEOUT left over from an earlier transaction therefore
+stayed latched, and the next edp_wait_reply() saw it and declared a timeout
+before the new AUX frame had even been sent.
+
+That is not theoretical on this board. Entering Type-C DP Alt Mode resets the
+shared SerDes and reliably leaves a timeout latched behind, so the first DPCD
+read after a plug fails even though AUX itself is healthy - which in turn
+leaves the link policy maker with no sink capabilities to work from.
+
+TR_INTERRUPT_STATE is read-only and does not clear the latch; reading
+TR_INTERRUPT_CAUSE is what does. Do that at the top of each request.
+
+Also fix the reply FIFO drain bound while here. The guard read one entry past
+the caller's buffer (i <= len instead of i < len) whenever the sink returned
+more bytes than were asked for, overrunning the destination by one byte.
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+--- a/bsp/drivers/drm/sunxi_device/hardware/lowlevel_edp/trilinear_dp14/trilinear_dp14.c
++++ b/bsp/drivers/drm/sunxi_device/hardware/lowlevel_edp/trilinear_dp14/trilinear_dp14.c
+@@ -458,6 +458,13 @@
+ 	int i = 0;
+ 	int cmd;
+ 
++	/* Clear any stale interrupt cause (e.g. REPLY_TIMEOUT) latched from a
++	 * prior transaction. TR_INTERRUPT_STATE is read-only; reading
++	 * TR_INTERRUPT_CAUSE is what actually clears the latch. Without this,
++	 * edp_wait_reply() can see a false timeout before the next frame
++	 * even starts. */
++	TR_READ(edp_hw, TR_INTERRUPT_CAUSE);
++
+ 	while (!edp_aux_ready(edp_hw)) {
+ 		if (count > 5000) {
+ 			EDP_ERR("last aux reply request timeout, aux request fail now!\n");
+@@ -530,7 +537,7 @@
+ 	case AUX_ACK:
+ 		for (i = 0; i < request.data_len; i++) {
+ 			/* add limit to avoid memory exceed */
+-			if (i <= len) {
++			if (i < len) {
+ 				buf[i] = TR_READ(edp_hw, TR_AUX_REPLY_DATA_FIFO);
+ 				EDP_LOW_DBG("[%s] result: buf[%d] = 0x%x\n", __func__, i, buf[i]);
+ 			}
+@@ -626,7 +633,7 @@
+ 	switch (reply_code) {
+ 	case AUX_ACK:
+ 		for (i = 0; i < request.data_len; i++) {
+-			if (i <= len) {
++			if (i < len) {
+ 				buf[i] = TR_READ(edp_hw, TR_AUX_REPLY_DATA_FIFO);
+ 				EDP_LOW_DBG("[%s] result: buf[%d] = 0x%x\n", __func__, i, buf[i]);
+ 			}

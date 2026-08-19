@@ -1,0 +1,94 @@
+drm: sunxi_drm_edp: force a real PHY recovery before Type-C AUX retries
+
+0102 correctly located the need to recover the AUX path after Type-C enters
+DP Alt Mode, but its `edp_phy_init()` / `edp_phy_enable(true)` sequence cannot
+actually do that. The generic PHY core reference-counts both operations: with
+the original bind reference still held, it increments the count and skips the
+provider's init and power_on callbacks. Each failed retry therefore did no
+hardware recovery and leaked another reference.
+
+Drop the bind reference before retrying, then initialise and power the PHYs
+again. Bring the DP/SerDes side up before AUX and tear it down in reverse, so
+the AUX provider programs its pad against the final shared-SerDes state.
+
+This follows 0102 and runs only from the delayed Type-C retry worker. The
+extcon notifier is not safe because it is called with combo0->phy_lock held,
+which phy_power_on() also takes.
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+--- a/bsp/drivers/drm/sunxi_drm_edp.c
++++ b/bsp/drivers/drm/sunxi_drm_edp.c
+@@ -802,24 +802,27 @@
+ static void edp_phy_enable(struct sunxi_drm_edp *drm_edp, bool en)
+ {
+ 	if (en) {
+-		if (drm_edp->aux_phy)
+-			phy_power_on(drm_edp->aux_phy);
+-
++		/* AUX shares the SerDes configuration with the DP PHY. Bring the
++		 * SerDes up first so AUX is always programmed against its final
++		 * state. */
+ 		if (drm_edp->combo_phy)
+ 			phy_power_on(drm_edp->combo_phy);
+ 
+-		if (drm_edp->dp_phy) {
++		if (drm_edp->dp_phy)
+ 			phy_power_on(drm_edp->dp_phy);
+-		}
++
++		if (drm_edp->aux_phy)
++			phy_power_on(drm_edp->aux_phy);
+ 	} else {
++		/* Reverse the dependency order: AUX goes down before its SerDes. */
+ 		if (drm_edp->aux_phy)
+ 			phy_power_off(drm_edp->aux_phy);
+ 
+-		if (drm_edp->combo_phy)
+-			phy_power_off(drm_edp->combo_phy);
+-
+ 		if (drm_edp->dp_phy)
+ 			phy_power_off(drm_edp->dp_phy);
++
++		if (drm_edp->combo_phy)
++			phy_power_off(drm_edp->combo_phy);
+ 	}
+ }
+ 
+@@ -4438,22 +4441,22 @@
+ 
+ 	mutex_lock(&drm_edp->typec_dp_lock);
+ 	if (drm_edp->typec_aux_retry > 0 && drm_edp->typec_aux_retry < 30) {
+-		/* Re-run the PHY and controller bring-up before each retry.
++		/* Recover the PHY and controller before each retry.
+ 		 *
+-		 * Both are initialised once, at bind, while the combo PHY is still
+-		 * muxed to USB. When typec later enters DP alt mode the combo PHY is
+-		 * reset underneath us, which takes the shared serdes block — and with
+-		 * it the AUX PHY's configuration — down. The controller's view of the
+-		 * PHY never comes back: TR_PHY_STATUS reads 0x0, AUX transmits into a
+-		 * PHY that is not ready, and every DPCD read ends in REPLY_TIMEOUT
+-		 * with the request sent and no reply (aux_status BIT4, int_state
+-		 * REPLY_TIMEOUT).
++		 * They were first initialised at bind while the combo PHY was still
++		 * muxed to USB. Entering Type-C DP Alt Mode resets the shared SerDes
++		 * block and loses the AUX configuration. A second phy_init() or
++		 * phy_power_on() alone cannot restore it: the PHY core reference-counts
++		 * both operations and does not invoke the provider again while the
++		 * original bind reference is still held. Drop that reference first so
++		 * the AUX provider reprograms its pad after the DP SerDes is ready.
+ 		 *
+-		 * This is the same sequence drm_dp_output_runtime_resume() runs, and
+-		 * this work is the only safe place for it. It cannot go in the extcon
+-		 * notifier: that is called from inside
+-		 * sunxi_cadence_combo0_dp_phy_set_mode() with combo0->phy_lock held,
+-		 * and phy_power_on() takes the same lock, so it would deadlock. */
++		 * This work is the safe recovery point. Doing it in the extcon notifier
++		 * would deadlock because it runs inside
++		 * sunxi_cadence_combo0_dp_phy_set_mode() with combo0->phy_lock held and
++		 * phy_power_on() takes the same lock. */
++		edp_phy_enable(drm_edp, false);
++		edp_phy_exit(drm_edp);
+ 		edp_phy_init(drm_edp);
+ 		edp_phy_enable(drm_edp, true);
+ 		edp_hw_controller_init(&drm_edp->edp_hw, &drm_edp->edp_core);

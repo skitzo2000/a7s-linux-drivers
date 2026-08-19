@@ -17,3 +17,30 @@ modules.builtin*
 # editor / os
 *~
 .DS_Store
+
+# board access notes — contains a login credential, do not commit
+A7S-ACCESS.md
+
+# working notes — session narrative, not deliverables
+DP-DRIVER-DESIGN.md
+NEXT-STEPS.md
+REVIEW-A7S-DP.md
+REVIEW-FRESH-EYES.md
+START-HERE.md
+THEORY-AUDIT.md
+patches/BUG-REPORT-dp-over-usbc.md
+old/
+Makefile
+
+# superseded DP patch numbering — the applied series is 0100-0110
+patches/0002-*.patch
+patches/0003-*.patch
+patches/0004-*.patch
+patches/0005-*.patch
+patches/0006-*.patch
+patches/0007-*.patch
+patches/0008-*.patch
+
+# superseded by the combined sun60i-a733-cubie-a7s-dp.dts
+overlays/sun60i-a733-typec-dp-altmode-svid.dts
+overlays/sun60i-a733-typec-dp-aux-bias.dts

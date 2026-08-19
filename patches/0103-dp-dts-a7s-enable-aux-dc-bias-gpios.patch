@@ -1,0 +1,31 @@
+arm64: dts: sun60i-a733-cubie-a7s: wire up the DP AUX DC-bias GPIOs
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts
+@@ -92,8 +92,22 @@
+ 		compatible = "allwinner,sunxi-phy-switcher";
+ 		reg = <0x0 0x10 0x0 0x0>;
+ 		// hotplug = <&pio PH 4 GPIO_ACTIVE_HIGH>;
+-		// aux_p = <&r_pio PL 10 GPIO_ACTIVE_HIGH>;
+-		// aux_n = <&r_pio PL 11 GPIO_ACTIVE_HIGH>;
++		/* DP AUX over USB-C is AC-coupled and needs a DC bias applied at the
++		 * source, and which line is pulled up vs down depends on cable
++		 * orientation. sunxi-phy-switcher.c implements that swap in
++		 * sunxi_phy_sw_set(), but every branch is guarded by gpio_is_valid()
++		 * and these two properties shipped commented out, so the bias was
++		 * never applied in either orientation and the AUX pair floated.
++		 *
++		 * A7S schematic v1.10:
++		 *   AUXP -- C105 100nF -- SBU1      PL10 -- SBU1-DC
++		 *   AUXN -- C107 100nF -- SBU2      PL11 -- SBU2-DC
++		 *
++		 * hotplug above stays commented: PH4 is GMAC1_TXD1 on this board and
++		 * claiming it breaks the GMAC. HPD arrives over CC as a VDM and
++		 * reaches DRM through extcon, so no GPIO is involved. */
++		aux_p = <&r_pio PL 10 GPIO_ACTIVE_HIGH>;
++		aux_n = <&r_pio PL 11 GPIO_ACTIVE_HIGH>;
+ 		phys = <&combo0_dp>, <&combo0_usb>;
+ 		phy-names = "dp-phy", "usb-phy";
+ 		dp_configure_delay = <20>;

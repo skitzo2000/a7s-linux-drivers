@@ -1,0 +1,200 @@
+drm: trilinear_dp14: AUX clock divider is 200MHz APB (measured), drive AUX pad direction
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+--- a/bsp/drivers/drm/sunxi_device/hardware/lowlevel_edp/trilinear_dp14/trilinear_dp14.c
++++ b/bsp/drivers/drm/sunxi_device/hardware/lowlevel_edp/trilinear_dp14/trilinear_dp14.c
+@@ -17,6 +17,8 @@
+ #include <linux/io.h>
+ #include <linux/of_gpio.h>
+ #include <linux/gpio.h>
++#include <linux/moduleparam.h>
++#include <linux/phy/phy.h>
+ 
+ #define LS_PER_TU	64
+ 
+@@ -246,6 +248,90 @@
+ 	return RET_OK;
+ }
+ 
++/* ---- AUX pad direction, half-duplex -------------------------------------
++ *
++ * DP AUX is a half-duplex differential pair. On this SoC the pad's direction
++ * is not owned by the DP controller at all: it lives in the combo PHY's
++ * AUX_HPD_PHY_PINS_CTRL0, bit 9 CFG_AUX_TX_DIRECTION (UM V0.92 §18.2.6.12),
++ * where 1 enables TX_EN and 0 enables RX_EN. The vendor driver sets bit 8
++ * (CFG_AUX_EN) once at PHY power-on and never writes bit 9, so the pad is
++ * parked receive-only for the life of the link. The AUX engine happily runs
++ * its state machine, TR_AUX_STATUS reports the request as sent, and nothing
++ * is ever physically driven onto SBU1/SBU2 — which is exactly the observed
++ * failure: request transmitted, no reply, AUX_REPLY_CLOCK_WIDTH stuck at 0.
++ *
++ * So the controller has to drive the direction itself: TX while the request
++ * shifts out, then back to RX before the sink starts replying. The combo PHY
++ * exposes that as a phy ->set_mode, so we go through the phy API rather than
++ * mapping someone else's registers.
++ *
++ * Timing is the part that has to be right. Writing TR_AUX_COMMAND only STARTS
++ * the transmission; the frame then shifts out at 1 Mbaud. Flipping to RX
++ * immediately after the command write truncates the request mid-frame and the
++ * sink sees a malformed transaction, so we have to wait out the transmission
++ * first. The sink is required to begin its reply within 300us of the request's
++ * STOP, so there is a wide window to turn around in — but it is bounded, and
++ * turning around too late loses the head of the reply just as surely as too
++ * early loses the tail of the request.
++ */
++static struct phy *aux_dir_phy;
++
++/* Extra microseconds added to the computed transmit duration before the pad is
++ * turned around. Tunable because the computed figure below is derived from the
++ * DP AUX frame format rather than measured on this silicon, and the turnaround
++ * window is the one parameter here that cannot be read back from a register.
++ */
++static unsigned int aux_tx_margin_us = 40;
++module_param(aux_tx_margin_us, uint, 0644);
++MODULE_PARM_DESC(aux_tx_margin_us, "AUX TX->RX turnaround margin in us (default 40)");
++
++int sunxi_cadence_aux_set_tx_direction(struct phy *phy, bool transmit);
++
++/* Log the first few direction changes so the pad state can be confirmed on a
++ * running board without a function tracer. Costs nothing after the first few. */
++static int aux_dir_log_budget = 8;
++
++static void edp_aux_set_direction(bool transmit)
++{
++	int ret;
++
++	if (!aux_dir_phy) {
++		if (aux_dir_log_budget > 0) {
++			aux_dir_log_budget--;
++			EDP_ERR("aux dir: no phy handle, pad direction NOT driven\n");
++		}
++		return;
++	}
++
++	ret = sunxi_cadence_aux_set_tx_direction(aux_dir_phy, transmit);
++
++	if (aux_dir_log_budget > 0) {
++		aux_dir_log_budget--;
++		EDP_ERR("aux dir: %s -> CTRL0(low16)=0x%04x bit9=%d\n",
++			transmit ? "TX" : "RX", ret & 0xffff,
++			ret < 0 ? -1 : !!(ret & BIT(9)));
++	}
++}
++
++/* How long the request frame occupies the wire, in microseconds.
++ *
++ * AUX runs at 1 Mbaud, so one bit-time is one microsecond. A request is a
++ * 16 bit-time SYNC preamble (DP mode; eDP mode uses 8), START, a 4-byte
++ * header of CMD(4b) + ADDR(20b) + LEN(8b), the payload if this is a write,
++ * and STOP.
++ */
++static unsigned int edp_aux_tx_duration_us(struct edp_aux_request *request)
++{
++	unsigned int bits = 16 + 2 + 32 + 2;
++
++	if (request->cmd_code == TR_DP_CMD_REQUEST_WRITE ||
++	    request->cmd_code == TR_DP_CMD_REQUEST_I2C_WRITE ||
++	    request->cmd_code == TR_DP_CMD_REQUEST_I2C_WRITE_MOT)
++		bits += 8 * request->data_len;
++
++	return bits + aux_tx_margin_us;
++}
++
+ /*0:edp_mode   1:dp_mode*/
+ /* difference between dp and edp mode, is the lenth of aux sync header
+  * dp mode lenth: 16
+@@ -254,9 +340,44 @@
+ static void trilinear_aux_init(struct sunxi_edp_hw_desc *edp_hw, struct edp_tx_core *edp_core)
+ {
+ 	u32 mode = edp_core->controller_mode;
+-	// FIXME: 200 refer to raw code from SHC
++	/* TR_AUX_CLOCK_DIVIDER carries the AUX engine's source (APB) clock in MHz
++	 * so it can divide down to the internal 1 MHz AUX clock (UM V0.92
++	 * §15.4.7.24, "e.g. set to 75 for a 75MHz APB clock", valid range 10-400).
++	 *
++	 * The vendor's 200 is CORRECT. This was measured on the board rather than
++	 * inferred, because clk_summary is misleading here: it shows clk_bus_edp
++	 * at 26 MHz, which is a real clock but NOT the one this engine divides.
++	 *
++	 * The measurement uses AUX_REPLY_TIMEOUT_INTERVAL (§15.4.7.25), which is
++	 * specified in *microseconds* and is counted off the internal 1 MHz clock.
++	 * So the programmed value equals the observed wall-clock timeout only when
++	 * the internal clock really is 1 MHz. Programming 440 and timing the
++	 * REPLY_TIMEOUT interrupt on a Radxa Cubie A7S:
++	 *
++	 *   divider  measured timeout
++	 *   26       ~0 us      (internal clock way too fast)
++	 *   52       ~70 us
++	 *   104      ~210 us
++	 *   200      ~450 us    <- matches the programmed 440 us
++	 *
++	 * internal = APB / divider, so 440 counts landing on 440 us at a divider
++	 * of 200 means APB is 200 MHz. Setting 26 makes the internal clock 7.7 MHz
++	 * and transmits AUX 7.7x too fast for any sink to decode.
++	 *
++	 * Note when re-deriving this: the timeout field is only 9 bits (max 511),
++	 * so values above that alias and produce nonsense. */
+ 	u32 src_apb_clk = 200;
+ 
++	/* Grab the AUX PHY so the request path can drive the pad direction.
++	 * edp_send_aux_request() only gets a sunxi_edp_hw_desc, which has no
++	 * route to the phy, and edp_tx_core is where sunxi_drm_edp.c parks the
++	 * handle from devm_phy_get(dev, "aux-phy"). A733 instantiates exactly one
++	 * eDP controller, so a file-scope handle is sufficient here; if a future
++	 * SoC ships two, this needs to move into sunxi_edp_hw_desc. */
++	aux_dir_phy = edp_core->aux_phy;
++	if (!aux_dir_phy)
++		EDP_ERR("no aux-phy handle, AUX pad direction cannot be driven\n");
++
+ 	// FIXME: pass from dts
+ 	mode = 1;
+ 	if (mode == AUX_EDP_MODE)
+@@ -305,7 +426,17 @@
+ 			EDP_ERR("edp wait aux retry timeout!\n");
+ 			return RET_AUX_TIMEOUT;
+ 		} else if (edp_aux_reply_timeout(edp_hw)) {
+-			EDP_ERR("edp wait aux reply timeout!\n");
++			/* An AUX timeout has two very different causes and the bare
++			 * message cannot tell them apart. phy_status == 0 means the
++			 * combo PHY is not up at all and AUX is transacting into dead
++			 * silicon; phy_status != 0 with a reply timeout means the PHY
++			 * is alive and the AUX bit timing (clkdiv) is suspect. */
++			EDP_ERR("edp wait aux reply timeout! phy_status:0x%x aux_status:0x%x int_state:0x%x clkdiv:0x%x reply:0x%x\n",
++				TR_READ(edp_hw, TR_PHY_STATUS),
++				TR_READ(edp_hw, TR_AUX_STATUS),
++				TR_READ(edp_hw, TR_INTERRUPT_STATE),
++				TR_READ(edp_hw, TR_AUX_CLOCK_DIVIDER),
++				TR_READ(edp_hw, TR_AUX_REPLY_CODE));
+ 			return RET_AUX_TIMEOUT;
+ 		} else if (edp_aux_reply_error(edp_hw)) {
+ 			EDP_ERR("edp aux reply error!\n");
+@@ -323,6 +454,7 @@
+ 			 struct edp_aux_request *request)
+ {
+ 	unsigned int count = 0;
++	unsigned int tx_us;
+ 	int i = 0;
+ 	int cmd;
+ 
+@@ -351,8 +483,20 @@
+ 	cmd |= request->data_len - 1;
+ 
+ 	EDP_LOW_DBG("[%s] aux_cmd: 0x%x addr:0x%x\n", __func__, cmd, request->address);
++
++	/* Drive the pad before the command write, because that write is what
++	 * starts the frame going out. */
++	edp_aux_set_direction(true);
++
+ 	TR_WRITE(edp_hw, TR_AUX_COMMAND, cmd);
+ 
++	/* Hold TX until the request has actually left, then turn around so the
++	 * reply can be received. edp_wait_reply() polls from here on. */
++	tx_us = edp_aux_tx_duration_us(request);
++	usleep_range(tx_us, tx_us + 20);
++
++	edp_aux_set_direction(false);
++
+ 	return RET_OK;
+ }
+ 

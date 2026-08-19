@@ -1,7 +1,7 @@
 # overlays — device tree for the cyberdeck shield
 
-Two overlays. One brings up the deck's screen, touch, and radio sockets. The other shuts up a log
-flood that was drowning everything else.
+Three overlays. One brings up the deck's screen, touch, and radio sockets. One shuts up a log
+flood that was drowning everything else. One fixes the USB-C DisplayPort alt-mode SVID.
 
 Both are BSP-dialect DT — `spi_sunxi_ng`, sun60iw2 pinctrl — built against 6.18.19-edge-sun60iw2.
 
@@ -47,18 +47,85 @@ for longer than I'd like to admit.
 
 The deck's display is the SPI panel on `fb0`, not `card0`, so nothing needs edp0.
 
+**Superseded.** `patches/0005` drops those two prints to `EDP_DRV_DBG`, which kills the flood
+without disabling the node — and disabling `edp0` also disables DisplayPort, so if you are running
+that patch you want this overlay *out*. It is kept for anyone on a stock kernel.
+
+## sun60i-a733-cubie-a7s-dp.dts
+
+Everything DisplayPort-over-USB-C needs from the device tree, in one overlay. **Load this for DP;
+it is the piece without which nothing else in the DP path matters.**
+
+### DP alt-mode SVID width
+
+The BSP declares the connector's alt mode with a 32-bit cell, `svid = <0xff01>`. On 6.18 the
+Type-C class reads that property as a *16-bit* value:
+
+```c
+u16 svid;
+ret = fwnode_property_read_u16(child, "svid", &svid);
+```
+
+`of_property_read_u16()` on a 4-byte big-endian property returns the first two bytes — `0x0000`.
+(`vdo` uses the u32 accessor, which is why only `svid` is affected.) So the port advertised
+DisplayPort under SVID 0, never matched the sink's `0xff01`, and DP alt mode was never entered:
+the mux sat in `STATE_USB` with no DP lanes, no HPD, and no AUX ever attempted.
+
+The fix is one line — declare `svid` at the width the kernel reads:
+
+```dts
+svid = /bits/ 16 <0xff01>;
+```
+
+### AUX DC bias
+
+DP AUX over USB-C is AC-coupled and needs a DC bias applied at the source for the sink to
+recognise a valid AUX partner. Which line is pulled up and which down depends on cable
+orientation, since AUX+/AUX− map to SBU1/SBU2 differently when the plug is flipped. On the A7S
+(schematic v1.10) that bias is two SoC GPIOs driving the DC side of the coupling caps:
+
+```
+AUXP ── C105 100nF ── SBU1          PL10 ── SBU1-DC
+AUXN ── C107 100nF ── SBU2          PL11 ── SBU2-DC
+```
+
+`sunxi-phy-switcher.c` already implements the orientation swap; the vendor DTS just leaves the
+two GPIOs commented out, so the code was unreachable. This overlay wires them up.
+
+Note the vendor's `hotplug` GPIO stays commented out deliberately: PH4 is `GMAC1_TXD1` on this
+board, and claiming it breaks ethernet. HPD arrives over CC as a VDM and reaches DRM through
+extcon, so no GPIO is involved.
+
+### Verifying
+
+```sh
+cat /sys/class/typec/port0/port0.0/svid                        # ff01, was 0000
+cat /sys/class/typec/port0-partner/port0-partner.0/active      # yes, was no
+cat /sys/class/drm/card0-DP-1/status                           # connected
+```
+
+With this overlay and the `0100`–`0110` kernel patches, the board negotiates DP alt mode, trains
+the link and scans out. See [`patches/README.md`](../patches/README.md).
+
 ## Build and install
 
 ```sh
-dtc -@ -I dts -O dtb -o sun60i-a733-cyberdeck-shield.dtbo sun60i-a733-cyberdeck-shield.dts
-dtc    -I dts -O dtb -o sun60i-a733-cyberdeck-noedp.dtbo  sun60i-a733-cyberdeck-noedp.dts
+dtc -@ -I dts -O dtb -o sun60i-a733-cyberdeck-shield.dtbo    sun60i-a733-cyberdeck-shield.dts
+dtc    -I dts -O dtb -o sun60i-a733-cyberdeck-noedp.dtbo     sun60i-a733-cyberdeck-noedp.dts
+dtc -@ -I dts -O dtb -o sun60i-a733-cubie-a7s-dp.dtbo         sun60i-a733-cubie-a7s-dp.dts
 sudo cp *.dtbo /boot/dtb/allwinner/overlay/
 ```
 
-Then in `/boot/armbianEnv.txt`:
+Then in `/boot/armbianEnv.txt` — on a stock kernel:
 
 ```
 overlays=cyberdeck-shield cyberdeck-noedp
+```
+
+or, if you are running the `patches/` kernel and want DisplayPort:
+
+```
+overlays=cyberdeck-shield cubie-a7s-dp
 ```
 
 Reboot. The shield overlay wants `-@` for the symbol table; the noedp one targets by node path and

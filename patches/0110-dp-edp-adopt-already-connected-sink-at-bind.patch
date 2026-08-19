@@ -1,0 +1,65 @@
+drm: sunxi_drm_edp: adopt an already-connected sink at bind
+
+The sink extcon notifier only delivers edges, so a sink that was already
+connected before this driver existed is never announced.
+
+That is the ordinary case when the cable is in at power-on. On a Cubie A7S the
+Type-C stack finishes negotiating DP alt mode and the combo PHY publishes
+EXTCON_DISP_DP well before drm_edp binds:
+
+  [ 4.782] set mux state STATE_SAFE -> STATE_DP_D   status:0x1a
+  [ 5.032] set mux state STATE_DP_D -> STATE_DP_D   status:0x9a   <- extcon DP=1
+  [ 5.465] sunxi-drm: bound 5740000.edp0                          <- listener appears
+
+The event lands with nobody subscribed. The provider extcon then reads DP=1
+while the connector sits at "disconnected" indefinitely, and the only ways out
+are a physical re-plug or a manual
+"echo detect > /sys/class/drm/card0-DP-1/status". That manual step has been
+mistaken for a detect race before; it is really this missed edge.
+
+Read the level once, after subscribing to the edges. Ordering matters: register
+first, so a change racing the read is either caught by the notifier or visible
+in what is read, and cannot be missed by both.
+
+Only the flag is set here. The detect kthread has not started at this point, so
+it observes hpd_state_now != hpd_state on its first pass and runs the ordinary
+plug path once the hardware is up, instead of driving AUX from probe context.
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+--- a/bsp/drivers/drm/sunxi_drm_edp.c
++++ b/bsp/drivers/drm/sunxi_drm_edp.c
+@@ -3036,6 +3036,33 @@
+ 			DRM_ERROR("register extcon notifier for edp fail\n");
+ 			goto ERR_CLK;
+ 		}
++
++		/*
++		 * The notifier only delivers edges, so a sink that was already
++		 * connected before this driver existed is never announced.
++		 *
++		 * That is the normal case when the cable is in at power-on: on
++		 * the Cubie A7S, Type-C finishes negotiating DP alt mode and the
++		 * combo PHY publishes EXTCON_DISP_DP at about t=5.03s, while
++		 * drm_edp does not bind until t=5.47s. The event lands with no
++		 * listener, the connector stays "disconnected" forever, and the
++		 * only way out is a physical re-plug or a manual
++		 * "echo detect > /sys/class/drm/card0-DP-1/status".
++		 *
++		 * Take the level after subscribing to the edges. Ordering
++		 * matters: registering first means a change racing this read is
++		 * either caught by the notifier or reflected in what we read,
++		 * never dropped by both.
++		 *
++		 * Only the flag is set here. The detect kthread has not started
++		 * yet, so it picks this up as a hpd_state_now != hpd_state edge
++		 * on its first pass and runs the normal plug path once the
++		 * hardware is actually up - rather than doing AUX from probe.
++		 */
++		if (extcon_get_state(drm_edp->extcon_sink, EXTCON_DISP_DP) > 0) {
++			EDP_DRV_DBG("sink already connected at bind, seeding hpd\n");
++			drm_edp->hpd_state_now = true;
++		}
+ 	}
+ #endif
+ 

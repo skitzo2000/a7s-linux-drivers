@@ -1,0 +1,148 @@
+drm: sunxi_edp: retry link training on a reduced configuration
+
+edp_main_link_setup() trained once and returned the failure, so a single bad
+guess about the link left the connector dark with no recovery. DP 1.4 requires
+a source to fall back to a reduced configuration and retry.
+
+Add a bounded fallback around edp_link_training(). Lanes are dropped before
+the rate: a lane that is not physically connected - the ordinary Type-C pin-D
+case, where only two of four lanes reach the sink - is never recovered by
+slowing the symbol rate, whereas a merely marginal channel usually is.
+
+Configurations that cannot carry the current mode are skipped, so training
+never reports success on a link the video will not fit in. When no mode has
+been chosen yet (pixel_clk 0) that filter is inert and every configuration is
+tried. Swing and pre-emphasis are reset to level 0 between attempts, as the
+spec requires for a fresh training sequence.
+
+Signal-quality test mode (force_level) keeps the old single-attempt behaviour:
+the caller owns the exact drive levels there, so retrying on a different link
+would defeat the test.
+
+On success at anything other than the requested configuration the fallback is
+logged; on total failure lane_para is restored to what the link policy maker
+asked for, so the debug attributes and the next plug event report the intent
+rather than the last failed attempt.
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+--- a/bsp/drivers/drm/sunxi_device/sunxi_edp.c
++++ b/bsp/drivers/drm/sunxi_device/sunxi_edp.c
+@@ -15,6 +15,7 @@
+ #include <linux/io.h>
+ #include <linux/delay.h>
+ #include <linux/errno.h>
++#include <linux/kernel.h>	/* ARRAY_SIZE, for the training fallback table */
+ #include <linux/mm.h>
+ #include <linux/slab.h>
+ 
+@@ -1253,6 +1254,88 @@
+ 		return edp_full_link_train(edp_hw, edp_core);
+ }
+ 
++/* the standard DP link rates, ascending */
++static const u64 edp_train_rates[] = {
++	BIT_RATE_1G62, BIT_RATE_2G7, BIT_RATE_5G4, BIT_RATE_8G1,
++};
++
++/*
++ * Payload a link carries, in the same units as pixel_clk * bpp: DP 8b/10b
++ * puts 8 payload bits on the wire per 10 symbol bits, so one lane at bit_rate
++ * carries bit_rate/10 bytes per second.
++ */
++static u64 edp_train_capacity(u64 bit_rate, u32 lane_cnt)
++{
++	return (bit_rate / 10) * lane_cnt * 8;
++}
++
++/*
++ * Link training with fallback.
++ *
++ * DP 1.4 requires a source to retry on a reduced link configuration when
++ * training fails; this driver trained exactly once and gave up, so a single
++ * bad guess about the link left the connector permanently dark. The link
++ * policy maker in sunxi_drm_edp.c should make that rare, but it cannot know
++ * about a marginal cable or a lane that is electrically dead, so keep a
++ * bounded safety net here.
++ *
++ * Lanes are dropped before rate. A lane that is not physically connected -
++ * the common Type-C case, where a pin-D link wires only two of the four - is
++ * never recovered by slowing the symbol rate, whereas a merely marginal
++ * channel usually is. Configurations too small to carry the current mode are
++ * skipped, so training never "succeeds" onto a link the video will not fit
++ * in; when the mode is not known yet (pixel_clk 0) that filter is inert.
++ */
++static s32 edp_link_training_fallback(struct sunxi_edp_hw_desc *edp_hw,
++				      struct edp_tx_core *edp_core)
++{
++	struct edp_lane_para *lane_para = &edp_core->lane_para;
++	const u64 need = (u64)edp_core->timings.pixel_clk * lane_para->bpp;
++	const u64 start_rate = lane_para->bit_rate;
++	const u32 start_lane = lane_para->lane_cnt;
++	s32 ret = RET_FAIL;
++	u32 lane_cnt;
++	int i;
++
++	for (i = ARRAY_SIZE(edp_train_rates) - 1; i >= 0; i--) {
++		if (edp_train_rates[i] > start_rate)
++			continue;
++
++		for (lane_cnt = start_lane; lane_cnt >= 1; lane_cnt >>= 1) {
++			if (need && (edp_train_capacity(edp_train_rates[i], lane_cnt) < need))
++				continue;
++
++			lane_para->bit_rate = edp_train_rates[i];
++			lane_para->lane_cnt = lane_cnt;
++
++			ret = edp_link_training(edp_hw, edp_core);
++			if (ret >= 0) {
++				if ((lane_cnt != start_lane) || (lane_para->bit_rate != start_rate))
++					EDP_ERR("link training fell back to %u lane(s) @ %lluMbps, asked for %u @ %lluMbps\n",
++						lane_cnt, lane_para->bit_rate / 1000000,
++						start_lane, start_rate / 1000000);
++				return ret;
++			}
++
++			/* every attempt must start from swing/pre level 0 again */
++			edp_lane_training_para_reset(lane_para);
++		}
++	}
++
++	/*
++	 * Leave lane_para as the policy maker set it, not as the last failed
++	 * attempt left it, so the debug attributes and the next plug event
++	 * report what was actually intended.
++	 */
++	lane_para->bit_rate = start_rate;
++	lane_para->lane_cnt = start_lane;
++
++	EDP_ERR("link training failed on every configuration at or below %u lane(s) @ %lluMbps\n",
++		start_lane, start_rate / 1000000);
++
++	return ret;
++}
++
+ s32 edp_main_link_setup(struct sunxi_edp_hw_desc *edp_hw, struct edp_tx_core *edp_core,
+ 			bool bypass, bool force_level)
+ {
+@@ -1279,10 +1362,19 @@
+ 		/* only set lane para and force output if bypass */
+ 		edp_phy_set_lane_para(edp_core);
+ 		edp_hw_set_lane_para(edp_hw, edp_core);
+-	} else {
++	} else if (force_level) {
++		/*
++		 * Signal-quality test mode: the caller owns the exact swing and
++		 * pre-emphasis levels, so retrying on a different link would
++		 * defeat the point of the test. Train once, as before.
++		 */
+ 		ret = edp_link_training(edp_hw, edp_core);
+ 		if (ret < 0)
+ 			return ret;
++	} else {
++		ret = edp_link_training_fallback(edp_hw, edp_core);
++		if (ret < 0)
++			return ret;
+ 	}
+ 
+ 	/* if need force signal test, we force set sw and pre after training */

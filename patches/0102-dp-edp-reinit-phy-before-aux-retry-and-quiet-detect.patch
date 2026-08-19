@@ -1,0 +1,49 @@
+drm: sunxi_drm_edp: re-init PHY/controller before AUX retry, quiet connector detect
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+--- a/bsp/drivers/drm/sunxi_drm_edp.c
++++ b/bsp/drivers/drm/sunxi_drm_edp.c
+@@ -3118,12 +3118,12 @@
+ 	if (!drm_edp)
+ 		return connector_status_unknown;
+ 
+-	EDP_INFO("drm_edp->desc->connector_type: %d\n", drm_edp->desc->connector_type);
++	EDP_DRV_DBG("drm_edp->desc->connector_type: %d\n", drm_edp->desc->connector_type);
+ 	if (drm_edp->desc->connector_type == DRM_MODE_CONNECTOR_eDP) {
+ 		return connector_status_connected;
+ 	}
+ 
+-	EDP_INFO("drm_edp->hpd_state_now: %d\n", drm_edp->hpd_state_now);
++	EDP_DRV_DBG("drm_edp->hpd_state_now: %d\n", drm_edp->hpd_state_now);
+ 	return drm_edp->hpd_state_now ? connector_status_connected :
+ 				connector_status_disconnected;
+ }
+@@ -4438,6 +4438,27 @@
+ 
+ 	mutex_lock(&drm_edp->typec_dp_lock);
+ 	if (drm_edp->typec_aux_retry > 0 && drm_edp->typec_aux_retry < 30) {
++		/* Re-run the PHY and controller bring-up before each retry.
++		 *
++		 * Both are initialised once, at bind, while the combo PHY is still
++		 * muxed to USB. When typec later enters DP alt mode the combo PHY is
++		 * reset underneath us, which takes the shared serdes block — and with
++		 * it the AUX PHY's configuration — down. The controller's view of the
++		 * PHY never comes back: TR_PHY_STATUS reads 0x0, AUX transmits into a
++		 * PHY that is not ready, and every DPCD read ends in REPLY_TIMEOUT
++		 * with the request sent and no reply (aux_status BIT4, int_state
++		 * REPLY_TIMEOUT).
++		 *
++		 * This is the same sequence drm_dp_output_runtime_resume() runs, and
++		 * this work is the only safe place for it. It cannot go in the extcon
++		 * notifier: that is called from inside
++		 * sunxi_cadence_combo0_dp_phy_set_mode() with combo0->phy_lock held,
++		 * and phy_power_on() takes the same lock, so it would deadlock. */
++		edp_phy_init(drm_edp);
++		edp_phy_enable(drm_edp, true);
++		edp_hw_controller_init(&drm_edp->edp_hw, &drm_edp->edp_core);
++		usleep_range(50, 100);
++
+ 		if (typec_dp_try_communication(drm_edp)) {
+ 			drm_edp->typec_aux_retry = 0;
+ 			drm_edp->hpd_state_now = true;

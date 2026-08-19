@@ -1,0 +1,272 @@
+phy: sunxi-cadence-combophy: DP-only bring-up, orientation latch, AUX pad direction and polarity
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+--- a/bsp/drivers/phy/sunxi-cadence-combophy.c
++++ b/bsp/drivers/phy/sunxi-cadence-combophy.c
+@@ -144,6 +144,7 @@
+ };
+ 
+ static int combo0_configure_usb_dp(struct sunxi_cadence_combophy *combo0);
++static void aux_hpd_apply_aux_polarity(struct sunxi_cadence_combophy *aux_phy);
+ 
+ /* Sub-System PCIE Bus Gating Reset Register */
+ #define SUBSYS_PCIE_BGR				0x0004
+@@ -1878,8 +1879,17 @@
+ 
+ static void combo0_dp_phy_power_on(struct sunxi_cadence_combophy *combo0)
+ {
+-	// set lane remap
+-	combo0_dp_lane_remap(combo0, TYPEC_ORIENTATION_NONE);
++	/* set lane remap
++	 *
++	 * combo0_dp_lane_remap() has a whole REVERSE branch that flips the lane
++	 * order, and the vendor called this with TYPEC_ORIENTATION_NONE wired in
++	 * — so that branch was dead and the lanes were always mapped as if the
++	 * plug were the right way up. The orientation-aware call site further
++	 * down in set_mode was left commented out.
++	 *
++	 * This does not affect AUX, which rides SBU1/SBU2 rather than the
++	 * SuperSpeed lanes, but it scrambles the main link on a flipped cable. */
++	combo0_dp_lane_remap(combo0, combo0->orientation);
+ 
+ 	// set lane invert
+ 	combo0_dp_lane_invert(combo0);
+@@ -2412,18 +2422,72 @@
+ 	switch (mode) {
+ 	case PHY_MODE_DP:
+ 		if ((combo0->orientation != orientation) || (combo0->state != state)) {
+-			if ((state == TYPEC_DP_STATE_D) || (state == TYPEC_DP_STATE_F)) {
++			bool orientation_changed = (combo0->orientation != orientation);
++
++			/* combo0_configure_usb_dp() and combo0_dp_phy_reset() both pick
++			 * their register sets from combo0->orientation, but it is only
++			 * latched at the bottom of this block — so the PHY was programmed
++			 * from the PREVIOUS orientation. Latch it before using it. */
++			combo0->orientation = orientation;
++
++			/* The aux-hpd PHY was powered on at bind, long before typec knew
++			 * which way round the plug was. Its AUX data polarity depends on
++			 * that, so push the new orientation across now that we have it. */
++			if (orientation_changed && combo0->sunxi_cphy &&
++			    combo0->sunxi_cphy->aux_hpd) {
++				struct sunxi_cadence_combophy *aux_phy =
++					combo0->sunxi_cphy->aux_hpd;
++
++				mutex_lock(&aux_phy->phy_lock);
++				aux_hpd_apply_aux_polarity(aux_phy);
++				mutex_unlock(&aux_phy->phy_lock);
++			}
++
++			if ((state == TYPEC_DP_STATE_D) || (state == TYPEC_DP_STATE_F))
+ 				combo0->usb_dp_state = true;
++			else
++				combo0->usb_dp_state = false;
++
++			/* Bring the combo PHY up for BOTH typec-DP layouts.
++			 *
++			 * This used to run only for STATE_D/F (2-lane DP + USB3); STATE_C/E
++			 * (4-lane DP, no USB3) fell through doing nothing, leaving the PHY
++			 * in IDDQ with its PLL never enabled. AUX rides that same analog
++			 * block, so every DPCD read timed out even though PD, the mux and
++			 * HPD all reported healthy.
++			 *
++			 * The two layouts need DIFFERENT configurations, though.
++			 * combo0_configure_usb_dp() lays the PHY out as 2 lanes DP + 2
++			 * lanes USB3 — correct for STATE_D/F. For STATE_C/E all four lanes
++			 * are DP, and the register set for that lives in
++			 * combo0_dp_set_rate()'s !usb_dp_state path, which also clears
++			 * IDDQ and programs the PLL for the link rate.
++			 *
++			 * That path is normally only reached from phy_configure() during
++			 * link training — which needs DPCD, which needs AUX, which needs
++			 * this PHY to be up. Break that circle by programming a default
++			 * rate here so AUX has a live PHY to talk through; link training
++			 * re-runs it with the negotiated rate later. */
++			if (combo0->usb_dp_state) {
+ 				combo0_dp_phy_reset(combo0, false);
+ 				combo0_configure_usb_dp(combo0);
+ 				combo0_dp_phy_reset(combo0, true);
+ 			} else {
+-				combo0->usb_dp_state = false;
++				struct phy_configure_opts_dp dp_boot = { };
++
++				dp_boot.set_rate = 1;
++				dp_boot.link_rate = 1620;	/* RBR — every DP sink supports it */
++				combo0_dp_set_rate(combo0, &dp_boot);
+ 			}
+ 
+-			// set lane remap
+-			//combo0_dp_lane_remap(combo0, orientation);
+-			if (combo0->orientation != orientation) {
++			/* set lane remap — orientation is latched above, so the REVERSE
++			 * branch is now reachable. Re-run it here as well as at power_on,
++			 * because power_on happens before typec has told us which way
++			 * round the plug is. */
++			if (orientation_changed)
++				combo0_dp_lane_remap(combo0, orientation);
++
++			if (orientation_changed) {
+ 				val = readl(COMB0_REG_PHYPINS_LINK_CTRL0(combo0->top_reg));
+ 				if (orientation == TYPEC_ORIENTATION_REVERSE)
+ 					val |= PHY0_TYPEC_CONN_DIR;
+@@ -3837,6 +3901,50 @@
+ 	.owner		= THIS_MODULE,
+ };
+ 
++/* AUX data polarity follows cable orientation.
++ *
++ * UM V0.92 §18.2.6.14, AUX_HPD_PHY_PINS_CTRL2 (0x1e08):
++ *
++ *   bit 29  AUX_DATA_OUT_POLAR_SEL  1: polarity of AUX data out to the DP
++ *                                      controller through the AUX PHY inverted
++ *   bit 28  AUX_DATA_IN_POLAR_SEL   1: polarity of AUX data in from the DP
++ *                                      controller through the AUX PHY inverted
++ *
++ * AUX rides SBU1/SBU2, and USB-C swaps those two pins when the plug is
++ * flipped. So on a reversed cable AUX+ and AUX- arrive transposed and the
++ * whole differential pair is inverted end to end.
++ *
++ * The board handles the DC side of that: phy_switcher's aux_p/aux_n GPIOs
++ * swap which line is biased up and which down. Nothing handles the DATA side.
++ * The vendor writes 0x1e08 as a flat zero, which hardcodes normal polarity,
++ * so with a reversed plug the sink receives Manchester-coded requests with
++ * every symbol inverted, decodes nothing valid, and never replies — while
++ * every status bit the driver can see still reports a healthy, locked link.
++ * That is exactly the observed failure, and it is why AUX_REPLY_CLOCK_WIDTH
++ * reads 0: not a malformed reply, no reply at all.
++ *
++ * Invert both directions when the plug is reversed. Both, because the pair is
++ * physically transposed in both directions, not just on transmit.
++ *
++ * Orientation lives on combo0, not here — the aux-hpd PHY is a separate
++ * instance — so reach it through the shared sunxi_cadence_phy. Callers hold
++ * aux_phy->phy_lock.
++ */
++static void aux_hpd_apply_aux_polarity(struct sunxi_cadence_combophy *aux_phy)
++{
++	struct sunxi_cadence_phy *sunxi_cphy = aux_phy->sunxi_cphy;
++	enum typec_orientation orientation = TYPEC_ORIENTATION_NORMAL;
++	u32 invert;
++
++	if (sunxi_cphy && sunxi_cphy->combo0)
++		orientation = sunxi_cphy->combo0->orientation;
++
++	invert = (orientation == TYPEC_ORIENTATION_REVERSE) ? 0x1 : 0x0;
++
++	phy_set_lbits(aux_phy->top_reg + 0x08, 29, 1, invert);
++	phy_set_lbits(aux_phy->top_reg + 0x08, 28, 1, invert);
++}
++
+ static int sunxi_cadence_aux_hpd_power_on(struct phy *phy)
+ {
+ 	struct sunxi_cadence_combophy *aux_phy = phy_get_drvdata(phy);
+@@ -3853,21 +3961,99 @@
+ 
+ 	phy_set_lbits(aux_phy->top_reg + 0x04, 28, 1, 0x0);
+ 	phy_set_lbits(aux_phy->top_reg + 0x04, 24, 1, 0x0);
+-	phy_set_lbits(aux_phy->top_reg + 0x04, 16, 1, 0x1);
++	/* AUX_HPD_PHY_PINS_CTRL1 bits 23:16 are ATBSEL, a one-hot analog test-bus
++	 * select whose reset value is 0. 0x1 taps "AUX receiver diff pair source
++	 * voltage" onto the analog test bus (UM V0.92 §18.2.6.13). The vendor set
++	 * it to 0x1 unconditionally, i.e. the test bus is hanging off the AUX
++	 * receiver's differential pair during mission mode. Leave it at the
++	 * documented default so nothing is loading the RX pair. */
++	phy_set_lbits(aux_phy->top_reg + 0x04, 16, 1, 0x0);
+ 	phy_set_lbits(aux_phy->top_reg + 0x04, 8, 5, 0xe);
+ 	phy_set_lbits(aux_phy->top_reg + 0x04, 0, 5, 0xd);
+ 
+ 	phy_writel(aux_phy->top_reg + 0x08, 0);
+ 
++	/* ...then re-apply AUX data polarity for the current cable orientation.
++	 * The write above clears bits 29/28, which is only correct for a normally
++	 * oriented plug. See aux_hpd_apply_aux_polarity(). */
++	aux_hpd_apply_aux_polarity(aux_phy);
++
+ 	phy_set_lbits(aux_phy->top_reg + 0x00, 4, 1, 0x1);
+ 	phy_set_lbits(aux_phy->top_reg + 0x00, 5, 1, 0x1);
+ 	phy_set_lbits(aux_phy->top_reg + 0x00, 0, 1, 0x1);
+ 
++	/* Park the pad in receive. AUX is half-duplex and CFG_AUX_TX_DIRECTION
++	 * (bit 9) picks which half is enabled; the AUX engine in the DP
++	 * controller drives it per transaction via ->set_mode below. The vendor
++	 * never wrote bit 9 at all, so the pad sat receive-only forever and no
++	 * request was ever physically driven onto SBU. Write it explicitly rather
++	 * than relying on the reset value. */
++	phy_set_lbits(aux_phy->top_reg + 0x00, 9, 1, 0x0);
++
+ 	mutex_unlock(&aux_phy->phy_lock);
+ 
+ 	return 0;
+ }
+ 
++/* AUX pad direction, half-duplex.
++ *
++ * UM V0.92 §18.2.6.12, AUX_HPD_PHY_PINS_CTRL0 (0x1e00):
++ *
++ *   bit 9  CFG_AUX_TX_DIRECTION  0: enable AUX RX_EN, disable AUX TX_EN
++ *                                1: enable AUX TX_EN, disable AUX RX_EN
++ *   bit 8  CFG_AUX_EN            1: enable TX_EN/RX_EN per CFG_AUX_TX_DIRECTION
++ *
++ * The DP AUX engine has no idea this pad exists, so the controller driver has
++ * to flip the direction around each transaction: TX while the request shifts
++ * out, RX before the sink's reply lands. Exposed as a phy ->set_mode so the
++ * eDP side can drive it through the phy API rather than mapping our registers.
++ *
++ * submode: 0 = receive, 1 = transmit.
++ */
++static int sunxi_cadence_aux_hpd_set_mode(struct phy *phy, enum phy_mode mode,
++					  int submode)
++{
++	struct sunxi_cadence_combophy *aux_phy = phy_get_drvdata(phy);
++
++	if (mode != PHY_MODE_DP)
++		return -EINVAL;
++
++	mutex_lock(&aux_phy->phy_lock);
++	phy_set_lbits(aux_phy->top_reg + 0x00, 9, 1, submode ? 0x1 : 0x0);
++	mutex_unlock(&aux_phy->phy_lock);
++
++	return 0;
++}
++
++/* Direct AUX pad direction control, for the DP controller's AUX engine.
++ *
++ * The eDP side needs to flip this on every transaction, and going through
++ * phy_set_mode_ext() puts the generic PHY core's per-phy mutex in that path.
++ * This is the same register write without that indirection, so the AUX
++ * request path cannot be silently short-circuited by the PHY core.
++ *
++ * Returns the register value read back, so the caller can verify the write
++ * actually landed, or a negative errno.
++ */
++int sunxi_cadence_aux_set_tx_direction(struct phy *phy, bool transmit)
++{
++	struct sunxi_cadence_combophy *aux_phy;
++	u32 val;
++
++	if (!phy)
++		return -EINVAL;
++
++	aux_phy = phy_get_drvdata(phy);
++	if (!aux_phy || !aux_phy->top_reg)
++		return -ENODEV;
++
++	phy_set_lbits(aux_phy->top_reg + 0x00, 9, 1, transmit ? 0x1 : 0x0);
++	val = readl(aux_phy->top_reg + 0x00);
++
++	return (int)(val & 0xffff);
++}
++EXPORT_SYMBOL_GPL(sunxi_cadence_aux_set_tx_direction);
++
+ static int sunxi_cadence_aux_hpd_power_off(struct phy *phy)
+ {
+ 	return 0;
+@@ -3917,6 +4103,7 @@
+ 	.power_off	= sunxi_cadence_aux_hpd_power_off,
+ 	.init		= sunxi_cadence_aux_hpd_init,
+ 	.exit		= sunxi_cadence_aux_hpd_exit,
++	.set_mode	= sunxi_cadence_aux_hpd_set_mode,
+ 	.owner		= THIS_MODULE,
+ };
+ 

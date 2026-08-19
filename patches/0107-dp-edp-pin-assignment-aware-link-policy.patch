@@ -1,0 +1,221 @@
+drm: sunxi_drm_edp: pin-assignment-aware, bandwidth-aware DP link policy
+
+DP 1.4 picks the link configuration from the intersection of four constraints:
+source capability, sink capability, the physical channel, and the bandwidth
+the mode needs. edp_update_capacity() applied the first two, and only when
+DPCD had been read successfully:
+
+	if (drm_edp->dpcd_parsed && !edp_debug->lane_debug_en) {
+		lane_para->lane_cnt = min(src_cap->max_lane, sink_cap->max_lane);
+		lane_para->bit_rate = min(src_cap->max_rate, sink_cap->max_rate);
+	}
+
+Two things are wrong with that.
+
+The physical channel is missing. On Type-C the DP alt mode pin assignment
+decides how many lanes DP actually gets: pin C/E give it all four, pin D/F
+give it two and leave the other two to USB3. The vendor left a FIXME here
+asking exactly this question and never answered it.
+
+And the whole policy is skipped when DPCD is unavailable, which is precisely
+when a sane default matters most. On a failed plug-time DPCD read lane_para
+kept the devicetree values - edp_lane_cnt = <4> on this board - and the driver
+trained four lanes into a pin-D link with two lanes wired. The two lanes that
+go nowhere never reach clock recovery, so the swing walk runs to its ceiling
+and training dies with "swing voltage reach max level, training1(clock
+recovery training) fail". It also made src_max_lane_debug look inert, since
+that attribute is read inside the branch that was being skipped.
+
+Restructure the function as a real link policy maker:
+
+  - Ask the PHY for the lane budget. The combo PHY already tracks the
+    negotiated pin assignment and rejects an over-wide config through its
+    ->validate op, so query that rather than re-deriving it. A PHY with no
+    ->validate accepts everything, leaving eDP panels on four lanes as before.
+  - Apply the budget unconditionally, DPCD or not. Without DPCD, narrow the
+    existing configuration but never widen it on a guess.
+  - Choose the slowest standard rate that still carries the mode instead of
+    taking the rate from the devicetree. DP prefers more lanes at a lower
+    symbol rate, which also has more margin on a marginal channel.
+
+The bandwidth constraint needs the timings, which are only known after
+atomic_mode_set, so drm_dp_output_enable() re-runs the policy once the mode
+has been chosen. The plug-time call still applies the capability and pin
+constraints as early as possible.
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+--- a/bsp/drivers/drm/sunxi_drm_edp.c
++++ b/bsp/drivers/drm/sunxi_drm_edp.c
+@@ -889,10 +889,71 @@
+ 	//TODO
+ }
+ 
+-/* FIXME: we need to think about that: typec-dp out's 2LNAE+USB case,
+- * how DisplayPort's report its DPCD capbility? if it report
+- * 4lane max support, how to compatible with 2LANE+USB case?
+- * when should we update the lane para and phy para? */
++/*
++ * The standard DP link rates, ascending. A source should train the slowest
++ * rate that still carries the mode: a lower symbol rate has more margin on a
++ * marginal channel, and DP prefers "more lanes, slower" over "fewer, faster".
++ */
++static const u64 edp_link_rates[] = {
++	BIT_RATE_1G62, BIT_RATE_2G7, BIT_RATE_5G4, BIT_RATE_8G1,
++};
++
++/*
++ * What a link carries, in the same units as pixel_clk * bpp.
++ * DP 8b/10b encoding puts 8 payload bits on the wire for every 10 symbol
++ * bits, so one lane at bit_rate carries bit_rate/10 bytes per second.
++ */
++static u64 edp_link_capacity(u64 bit_rate, u32 lane_cnt)
++{
++	return (bit_rate / 10) * lane_cnt * 8;
++}
++
++/*
++ * How many lanes the physical channel actually has.
++ *
++ * On Type-C that is the DP alt mode pin assignment: pin C/E give DP all four
++ * high-speed lanes, pin D/F give it two and leave the other two to USB3. The
++ * combo PHY already tracks the negotiated assignment and rejects an over-wide
++ * configuration through its ->validate op, so ask it instead of duplicating
++ * the knowledge here. A PHY without ->validate accepts everything, which
++ * leaves non-Type-C (eDP panel) setups at the full four lanes as before.
++ */
++static u32 edp_phy_lane_budget(struct sunxi_drm_edp *drm_edp)
++{
++	u32 lane_cnt;
++
++	for (lane_cnt = 4; lane_cnt > 1; lane_cnt >>= 1)
++		if (edp_phy_validate_lane_cnt(drm_edp, lane_cnt) == 0)
++			break;
++
++	return lane_cnt;
++}
++
++/*
++ * The DP link policy maker: choose the (lane_cnt, bit_rate) to train at.
++ *
++ * DP 1.4 picks that from the intersection of four constraints. The vendor
++ * code applied only the first two, and only when DPCD had been read:
++ *
++ *   1. source capability                                  - was applied
++ *   2. sink capability, from DPCD 0x001/0x002             - was applied
++ *   3. the physical channel: on Type-C the pin assignment - was NOT applied
++ *   4. the bandwidth the mode needs                       - was NOT applied
++ *
++ * Constraint 3, and the fact that the whole thing sat behind "did DPCD read
++ * work", is what made this board fail. A plug whose first DPCD read did not
++ * land left lane_para holding the devicetree defaults - edp_lane_cnt = <4> -
++ * and the driver then trained four lanes into a Type-C pin-D link that only
++ * has two of them wired to DP. That cannot recover: the two lanes that go
++ * nowhere never reach clock recovery, so the training loop walks the drive
++ * swing up to its maximum and gives up ("swing voltage reach max level,
++ * training1(clock recovery training) fail"). It also explains why the
++ * src_max_lane_debug attribute appeared to do nothing - it is read here, and
++ * this function was returning early.
++ *
++ * So the pin budget is now applied unconditionally, DPCD or no DPCD, and the
++ * rate is chosen to fit the mode rather than taken from the devicetree.
++ */
+ static void edp_update_capacity(struct sunxi_drm_edp *drm_edp)
+ {
+ 	struct edp_tx_core *edp_core = &drm_edp->edp_core;
+@@ -900,22 +961,68 @@
+ 	struct edp_tx_cap *src_cap = &drm_edp->source_cap;
+ 	struct edp_lane_para *lane_para = &edp_core->lane_para;
+ 	struct edp_debug *edp_debug = &drm_edp->edp_debug;
++	u32 lane_cnt, lane_budget;
++	u64 bit_rate, need;
++	int i;
++
++	/* the lane_cfg_debug attributes drive lane_para directly, keep off */
++	if (edp_debug->lane_debug_en)
++		return;
++
++	lane_budget = edp_phy_lane_budget(drm_edp);
++
++	/* constraint 1: the source, or whatever src_max_*_debug forces */
++	lane_cnt = edp_debug->src_max_lane ? edp_debug->src_max_lane : src_cap->max_lane;
++	bit_rate = edp_debug->src_max_rate ? edp_debug->src_max_rate : src_cap->max_rate;
++
++	if (drm_edp->dpcd_parsed) {
++		/* constraint 2: what the sink says it can take */
++		lane_cnt = min(lane_cnt, sink_cap->max_lane);
++		bit_rate = min(bit_rate, sink_cap->max_rate);
++	} else {
++		/*
++		 * No DPCD yet, so there is nothing better than what is already
++		 * configured - from the devicetree on the first pass. Narrow it
++		 * if the source is smaller, but never widen it on a guess. The
++		 * result can stay narrow across a re-plug into a wider pin
++		 * assignment; the first successful DPCD parse recomputes it
++		 * from source and sink and undoes that.
++		 */
++		lane_cnt = min(lane_cnt, lane_para->lane_cnt);
++		bit_rate = min(bit_rate, lane_para->bit_rate);
++	}
++
++	/* constraint 3: never wider than the pins DP was actually given */
++	lane_cnt = min(lane_cnt, lane_budget);
++	if (!lane_cnt)
++		lane_cnt = 1;
+ 
+ 	/*
+-	 * edp_debug's src_max_lane/src_max_rate can use for force specific
+-	 * lane/rate output for debug purpose
++	 * Constraint 4: with a mode chosen, drop to the slowest standard rate
++	 * that still carries it. This also runs at plug time, before there is
++	 * a mode - pixel_clk is 0 there and the fastest common rate stands.
+ 	 */
+-	if (drm_edp->dpcd_parsed && !edp_debug->lane_debug_en) {
+-		if (edp_debug->src_max_lane)
+-			lane_para->lane_cnt = min(edp_debug->src_max_lane, sink_cap->max_lane);
+-		else
+-			lane_para->lane_cnt = min(src_cap->max_lane, sink_cap->max_lane);
+-
+-		if (edp_debug->src_max_rate)
+-			lane_para->bit_rate = min(edp_debug->src_max_rate, sink_cap->max_rate);
+-		else
+-			lane_para->bit_rate = min(src_cap->max_rate, sink_cap->max_rate);
++	need = (u64)edp_core->timings.pixel_clk * lane_para->bpp;
++	if (need) {
++		for (i = 0; i < (int)ARRAY_SIZE(edp_link_rates); i++) {
++			if (edp_link_rates[i] > bit_rate)
++				break;
++			if (edp_link_capacity(edp_link_rates[i], lane_cnt) >= need) {
++				bit_rate = edp_link_rates[i];
++				break;
++			}
++		}
+ 	}
++
++	if ((lane_cnt != lane_para->lane_cnt) || (bit_rate != lane_para->bit_rate))
++		EDP_DRV_DBG("link policy: %u lane(s) @ %lluMbps (pin budget:%u src:%u/%lluMbps sink:%u/%lluMbps dpcd:%d)\n",
++			    lane_cnt, bit_rate / 1000000, lane_budget,
++			    src_cap->max_lane, src_cap->max_rate / 1000000,
++			    sink_cap->max_lane, sink_cap->max_rate / 1000000,
++			    drm_edp->dpcd_parsed);
++
++	lane_para->lane_cnt = lane_cnt;
++	lane_para->bit_rate = bit_rate;
+ }
+ 
+ static void sink_cap_reset(struct sunxi_drm_edp *drm_edp)
+@@ -3949,6 +4056,14 @@
+ 		EDP_ERR("timing is not set by edid or dts, please check!\n");
+ 		return RET_FAIL;
+ 	}
++
++	/*
++	 * Re-run the link policy now that a mode has been chosen. The plug-time
++	 * call could only apply the capability constraints; the bandwidth one
++	 * needs the timings, which atomic_mode_set has just filled in.
++	 */
++	edp_update_capacity(drm_edp);
++
+ 	clk_set_rate(drm_edp->clk, edp_core->timings.pixel_clk / edp_core->pixel_mode);
+ 	ret = edp_hw_enable(edp_hw, edp_core);
+ 	if (ret) {

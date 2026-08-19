@@ -1,0 +1,120 @@
+arm64: dts: a7s: use Type-C DP Alt-Mode lifecycle without HPD
+
+The Cubie A7S has no usable physical DisplayPort HPD input.  Once the
+Type-C controller enters DP Alt Mode, use that established lifecycle as
+the opt-in software DP extcon authority.  Notify the DP PHY explicitly
+when leaving Alt Mode so the DRM connector is torn down as well.
+
+This leaves hardware HPD, PHY-status, GPIO, SerDes, and controller
+register handling unchanged, and has no effect unless the A7S-only DT
+property is present.
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+diff --git a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts
+index e4a6837..a47ec62 100644
+--- a/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts
++++ b/arch/arm64/boot/dts/allwinner/sun60i-a733-cubie-a7s.dts
+@@ -108,6 +108,8 @@
+ 		 * reaches DRM through extcon, so no GPIO is involved. */
+ 		aux_p = <&r_pio PL 10 GPIO_ACTIVE_HIGH>;
+ 		aux_n = <&r_pio PL 11 GPIO_ACTIVE_HIGH>;
++		/* Type-C DP Alt Mode supplies lifecycle; physical HPD is unavailable. */
++		allwinner,typec-dp-no-hpd;
+ 		phys = <&combo0_dp>, <&combo0_usb>;
+ 		phy-names = "dp-phy", "usb-phy";
+ 		dp_configure_delay = <20>;
+@@ -946,6 +948,7 @@
+ 		lane_invert = <1 1 1 1>;
+ 		lane_remap = <0 1 2 3>;
+ 		typec_remap = <2 3 0 1>;
++		allwinner,typec-dp-no-hpd;
+ 	};
+ };
+ 
+diff --git a/bsp/drivers/phy/sunxi-cadence-combophy.c b/bsp/drivers/phy/sunxi-cadence-combophy.c
+index 0376b53..d964995 100644
+--- a/bsp/drivers/phy/sunxi-cadence-combophy.c
++++ b/bsp/drivers/phy/sunxi-cadence-combophy.c
+@@ -129,6 +129,8 @@ struct sunxi_cadence_phy {
+ 	bool usb_supported; /* USB can use combo0/1 or support only U3/U2 mode */
+ 	bool udp_supported; /* Both USB and DP can use combo0 meanwhile */
+ 	bool phy_switcher_quirk;
++	/* Board has Type-C DP Alt Mode but no usable physical DP HPD input. */
++	bool typec_dp_no_hpd;
+ 
+ 	struct regulator *serdes1v8_supply;
+ };
+@@ -2501,7 +2503,19 @@ static int sunxi_cadence_combo0_dp_phy_set_mode(struct phy *phy, enum phy_mode m
+ 			}
+ 		}
+ 
+-		// pr_info("combo0->hpd_state: %d, hpd_state: %d", combo0->hpd_state, hpd_state);
++		/*
++		 * Cubie A7S Type-C DP has no usable physical HPD input.  Its Type-C
++		 * controller has already established the DP Alt-Mode state, which is
++		 * the connection authority for this opt-in board.  Do not alter the
++		 * hardware HPD signal or controller registers; only publish the
++		 * software connection state through the existing DP extcon.
++		 */
++		if (sunxi_cphy->typec_dp_no_hpd)
++			hpd_state = state == TYPEC_DP_STATE_C ||
++				    state == TYPEC_DP_STATE_D ||
++				    state == TYPEC_DP_STATE_E ||
++				    state == TYPEC_DP_STATE_F;
++
+ 		if (combo0->hpd_state != hpd_state) {
+ 			if (sunxi_cphy->extcon)
+ 				extcon_set_state_sync(sunxi_cphy->extcon, EXTCON_DISP_DP, hpd_state);
+@@ -4335,6 +4349,8 @@ static int sunxi_cadence_phy_parse_dt(struct platform_device *pdev)
+ 	sunxi_cphy->usb_supported = !device_property_read_bool(dev, "usb-disable");
+ 	sunxi_cphy->udp_supported = !device_property_read_bool(dev, "udp-disable");
+ 	sunxi_cphy->phy_switcher_quirk = device_property_read_bool(dev, "aw,phy-switcher-quirk");
++	sunxi_cphy->typec_dp_no_hpd =
++		device_property_read_bool(dev, "allwinner,typec-dp-no-hpd");
+ 	/* parse top register, which determide general configuration such as mode */
+ 	sunxi_cphy->top_subsys_reg = devm_platform_ioremap_resource(pdev, 0);
+ 	if (IS_ERR(sunxi_cphy->top_subsys_reg))
+diff --git a/bsp/drivers/usb/typec/mux/sunxi-phy-switcher.c b/bsp/drivers/usb/typec/mux/sunxi-phy-switcher.c
+index 4d242e6..9b526e6 100644
+--- a/bsp/drivers/usb/typec/mux/sunxi-phy-switcher.c
++++ b/bsp/drivers/usb/typec/mux/sunxi-phy-switcher.c
+@@ -41,6 +41,8 @@ struct sunxi_phy_switcher {
+ 
+ 	bool hpd_status;
+ 	bool hpd_status_pre;
++	/* Keep the DP PHY lifecycle in sync on boards without physical HPD. */
++	bool typec_dp_no_hpd;
+ 
+ 	enum typec_orientation orientation;
+ 	unsigned long mode;
+@@ -306,6 +308,19 @@ sunxi_phy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+ 			if (phy_switcher->dp_phy)
+ 				phy_set_mode_ext(phy_switcher->dp_phy, PHY_MODE_DP, phy_switcher->phy_mode);
+ 		} else {
++			/*
++			 * The regular path only notifies the USB PHY when leaving DP Alt
++			 * Mode.  On an opt-in no-HPD board, notify the DP PHY first so it
++			 * drops its software DP extcon state and releases the connector.
++			 */
++			if (phy_switcher->typec_dp_no_hpd && phy_switcher->dp_phy &&
++			    (phy_switcher->mode == TYPEC_DP_STATE_C ||
++			     phy_switcher->mode == TYPEC_DP_STATE_D ||
++			     phy_switcher->mode == TYPEC_DP_STATE_E ||
++			     phy_switcher->mode == TYPEC_DP_STATE_F))
++				phy_set_mode_ext(phy_switcher->dp_phy, PHY_MODE_DP,
++						 phy_switcher->phy_mode);
++
+ 			if (phy_switcher->usb_phy)
+ 				phy_set_mode_ext(phy_switcher->usb_phy, PHY_MODE_USB_OTG, phy_switcher->phy_mode);
+ 		}
+@@ -394,6 +409,9 @@ static int sunxi_phy_switcher_probe(struct platform_device *pdev)
+ 	}
+ 	devm_extcon_dev_register(phy_switcher->dev, phy_switcher->extcon);
+ 
++	phy_switcher->typec_dp_no_hpd =
++		of_property_read_bool(node, "allwinner,typec-dp-no-hpd");
++
+ 	/* parse delay time before DP_CMD_CONFIGURE */
+ 	ret = of_property_read_u32(node, "dp_configure_delay", &phy_switcher->dp_configure_delay);
+ 	if (ret)
