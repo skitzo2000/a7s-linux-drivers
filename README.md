@@ -34,6 +34,10 @@ Other 6.18.x kernels should be fine. Anything older will fight you — a good ch
 work here is 6.18 API churn (`nth_page()` gone, `.remove` returning void, `EXTRA_CFLAGS` retired),
 and none of it is version-gated backward.
 
+Everything under `patches/` is one drop-in set: all twelve apply at `-p1` from the kernel source
+root and build. The baseline they were checked against, and how to tell a rebase went wrong, are in
+[`patches/README.md`](patches/README.md).
+
 ## Building
 
 `build-modules.sh` builds and installs both modules, runs depmod, and tells you what landed.

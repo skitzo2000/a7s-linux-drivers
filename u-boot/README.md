@@ -43,7 +43,14 @@ branch `A733` (`PLAT=sun60i_a733`).
 git clone -b allwinner/A733/next https://github.com/dlan17/u-boot
 cd u-boot
 git am /path/to/u-boot/patches/000*.patch
+```
 
+Both apply under `git apply` with no fuzz on top of `165f07a6` ("config: a733: add initial support
+for Cubie A7A"), which was the branch tip they were written against. `0001` is the only one that
+touches an existing file — `drivers/pinctrl/sunxi/pinctrl-sunxi.c`; `0002` creates the board DTS and
+defconfig, so it lands anywhere.
+
+```sh
 export CROSS_COMPILE=aarch64-linux-gnu-
 export BL31=/path/to/trusted-firmware-a/build/sun60i_a733/debug/bl31.bin
 make radxa-cubie-a7s_defconfig

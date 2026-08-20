@@ -4,6 +4,9 @@ The five BSP sources on the A7S DisplayPort path, with the fixes integrated in p
 same change as [`patches/0100`–`0110`](../patches/), in the other form: whole files instead of a
 series. Pick one route, not both.
 
+All five files are byte-identical to what you get by applying `0100`–`0110` to a stock BSP tree, so
+the two routes cannot drift apart silently — a `diff` catches it.
+
 **Status: working.** 2560×1440 on a cold boot with the cable already in, no debug knobs, no manual
 `echo detect`, survives a reboot. The findings behind each fix are written up in
 [`patches/README.md`](../patches/README.md); every change is also commented in place here, with the

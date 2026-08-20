@@ -130,3 +130,13 @@ overlays=cyberdeck-shield cubie-a7s-dp
 
 Reboot. The shield overlay wants `-@` for the symbol table; the noedp one targets by node path and
 doesn't.
+
+All three compile clean on dtc 1.7.2. Worth reading back the DP one, since the whole point of it is
+a property width:
+
+```sh
+dtc -I dtb -O dts sun60i-a733-cubie-a7s-dp.dtbo | grep svid    # svid = [ff 01];
+```
+
+Two bytes, not four — `[ff 01]` is what `fwnode_property_read_u16()` needs to see. If that comes
+back as `<0x0000ff01>` the `/bits/ 16` got lost and DP alt mode will never be entered.

@@ -106,6 +106,25 @@ new patches were actually picked up.
 The DP path also needs the device-tree overlays in [`overlays/`](../overlays/); without the SVID
 one, DP alt mode is never entered at all.
 
+### The baseline they apply to
+
+All twelve go on at `-p1` from the kernel source root, under `git apply` — no fuzz, no offsets —
+against:
+
+| | |
+|---|---|
+| BSP sources | `NickAlilovic/allwinner-bsp` at `9860a0e`, branch `linux-6.18.z` |
+| `sun60i-a733-cubie-a7s.dts` | as created by Armbian's `0012-Add-Allwinner-Device-a733-9860a0eff6.patch` |
+
+That is the state the Armbian edge build hands you, so the same twelve go in as one directory and
+come out the far side compiled: `axp8191_cpu_set_voltage_sel_stepped` and `axp8191_cpu_stepped_ops`
+land as symbols in `axp2101-regulator.o`, and the built DTB carries `allwinner,typec-dp-no-hpd` on
+both nodes with `aux_p`/`aux_n` at PL10/PL11.
+
+If you are checking a rebase, the diffstat Armbian prints per patch is the cheapest signal — `0001`
+should read `(+67/-3)[1M]`, and the DP series `(+195/-8)`, `(+146/-2)`, `(+23/-2)`, `(+16/-2)`,
+`(+38/-1)[3M]`, `(+25/-22)`, `(+9/-2)`, `(+131/-16)`, `(+93/-1)`, `(+23/-9)`, `(+27/-0)`.
+
 ### Sink coverage
 
 Proven on Type-C **pin D** (2 lanes) via a dock's native DP-alt output. `0107` computes the lane
