@@ -47,7 +47,7 @@ for longer than I'd like to admit.
 
 The deck's display is the SPI panel on `fb0`, not `card0`, so nothing needs edp0.
 
-**Superseded.** `patches/0005` drops those two prints to `EDP_DRV_DBG`, which kills the flood
+**Superseded.** `patches/0102` drops those two prints to `EDP_DRV_DBG`, which kills the flood
 without disabling the node — and disabling `edp0` also disables DisplayPort, so if you are running
 that patch you want this overlay *out*. It is kept for anyone on a stock kernel.
 

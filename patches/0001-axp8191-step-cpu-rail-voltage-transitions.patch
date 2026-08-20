@@ -20,12 +20,13 @@ ondemand + full 8-core load + 2 GHz + crossing the 60 C passive trip, so both
 governor and thermal transitions firing continuously. Zero resets, zero Oops.
 The stock kernel does not survive that for two minutes.
 
-Applies to the Allwinner BSP overlay tree (radxa/allwinner-bsp, branch
-linux-6.18.x) at its root. The regulator is CONFIG_AW_REGULATOR_AXP2101=y,
-so this needs a full Image rebuild — it is not a module.
+Applies at -p1 from the kernel source root, where the Allwinner BSP overlay
+tree (NickAlilovic/allwinner-bsp, branch linux-6.18.z) is mounted at bsp/.
+The regulator is CONFIG_AW_REGULATOR_AXP2101=y, so this needs a full Image
+rebuild — it is not a module.
 
---- a/drivers/power/regulator/axp2101-regulator.c
-+++ b/drivers/power/regulator/axp2101-regulator.c
+--- a/bsp/drivers/power/regulator/axp2101-regulator.c
++++ b/bsp/drivers/power/regulator/axp2101-regulator.c
 @@ -16,6 +16,7 @@
  
  #include "sunxi-power-regulator.h"

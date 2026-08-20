@@ -87,8 +87,9 @@ DPTx** (`CORE_ID` reads `0x000a0509`, and the register map is textbook DWC DP), 
 Unlike `gmac/` and `npu-vipcore/`, **these are not modules.** `CONFIG_AW_CADENCE_COMBOPHY=y` and
 `CONFIG_AW_DRM_EDP=y` mean the in-tree drivers already claim these compatibles at boot, so a
 module declaring the same compatible would never bind. Running this code means rebuilding the
-kernel Image. `dp/` mirrors the BSP layout exactly, so installing is a straight copy; the same
-changes are in `patches/` as Armbian userpatches, which is the easier route.
+kernel Image. `dp/` mirrors the BSP layout exactly, so installing is a straight copy — plus one
+device-tree property no overlay carries, noted in [`dp/README.md`](dp/README.md). The same changes
+are in `patches/` as Armbian userpatches, which is the easier route and needs no hand-editing.
 
 ## Licensing and provenance
 

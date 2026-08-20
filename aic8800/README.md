@@ -36,14 +36,24 @@ unthrottled printk is its own denial of service), and bails out of the read loop
 instead of spinning. The free is deferred past `spin_unlock_irqrestore()` because `aic_enqueue()`
 runs from URB completion with interrupts off.
 
-Apply it from your kernel source root:
+The patch is written against the in-tree path, so from your kernel source root:
 
 ```sh
 patch -p1 < aic8800/patches/0001-aic_btusb-free-dropped-skbs-and-stop-the-reader-spinning.patch
 ```
 
-It applies clean to the tree in `driver/`, and to the in-tree copy at
-`drivers/net/wireless/aic8800/`.
+The copy staged here in `driver/` is the same file three directories shallower, so apply it from
+`aic8800/driver/` with `-p5` instead:
+
+```sh
+cd aic8800/driver
+patch -p5 < ../patches/0001-aic_btusb-free-dropped-skbs-and-stop-the-reader-spinning.patch
+```
+
+**Line endings.** The AIC drop on BSP branches `linux-6.18.x` / `linux-6.18.y` is LF, and so is the
+copy in `driver/` — the patch targets those and applies clean. The copy on `linux-6.18.z` is CRLF
+and every hunk fails on it. Convert that file first (`sed -i 's/\r$//'`) or take the driver from an
+LF branch.
 
 ## 2. WiFi loads the wrong calibration table
 

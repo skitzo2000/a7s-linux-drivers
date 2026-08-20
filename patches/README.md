@@ -4,7 +4,8 @@ Kernel patches against the Allwinner BSP tree (`NickAlilovic/allwinner-bsp`, bra
 `linux-6.18.z`, which mounts at `bsp/` inside the kernel source).
 
 `0001` is a power fix and stands alone. `0100`–`0110` are the DisplayPort-over-USB-C series and
-apply in order.
+apply in order. All of them are `-p1` from the kernel source root, so the whole directory drops in
+as one set.
 
 ## 0001 — AXP8191 stepped CPU-rail voltage
 
