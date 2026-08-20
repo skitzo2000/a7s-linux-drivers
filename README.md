@@ -1,6 +1,6 @@
 # a7s-linux-drivers
 
-Out-of-tree kernel drivers, patches, and device-tree overlays for the **Radxa Cubie A7S** —
+Out-of-tree kernel drivers, bootloader patches, and device-tree overlays for the **Radxa Cubie A7S** —
 Allwinner **A733**, die `sun60iw2`, on **Linux 6.18**.
 
 Mainline doesn't know this SoC yet. The 6.18 edge images boot, but a few things the board
@@ -22,6 +22,7 @@ for that piece says so.
 | [`dp/`](dp/) | DisplayPort-over-USB-C — replacement sources for the three BSP drivers on the DP path | 2560×1440, automatic on boot, survives reboot |
 | [`patches/`](patches/) | AXP8191 CPU-rail fix, plus the DP series `0100`–`0110` | both verified on-board; need a full Image rebuild |
 | [`overlays/`](overlays/) | Device-tree overlays for the cyberdeck shield | in daily use |
+| [`u-boot/`](u-boot/) | Mainline U-Boot for the A7S — board file plus a sunxi pinctrl addition | boots an OS off a USB stick over FEL |
 
 ## The kernel
 

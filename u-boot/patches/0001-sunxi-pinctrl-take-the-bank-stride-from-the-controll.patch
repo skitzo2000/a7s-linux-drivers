@@ -1,0 +1,95 @@
+From 84b06018b14450b2bd1d62175093d84ed996c473 Mon Sep 17 00:00:00 2001
+From: skitzo2000 <goldfish.paul@gmail.com>
+Date: Wed, 19 Aug 2026 19:42:07 -0400
+Subject: [PATCH 1/2] sunxi: pinctrl: take the bank stride from the controller
+ description
+
+The A733 spaces the banks of its main pin controller 0x80 bytes apart, but
+its R pin controller keeps the older 0x30 spacing. The driver-model paths
+used SUNXI_PINCTRL_BANK_SIZE for both, so on the R controller every bank
+above PL was computed at the wrong offset: PM landed at base + 0x80, which
+is not implemented. Reads returned zero and writes went nowhere, so
+"gpio set PM5" reported success while the pin never moved.
+
+Store the stride in the plat data at bind time, picking
+SUNXI_R_PINCTRL_BANK_SIZE for a controller whose first bank is PL or later.
+Every other SoC defines the two to the same value, so nothing changes there.
+---
+ drivers/pinctrl/sunxi/pinctrl-sunxi.c | 19 ++++++++++++++-----
+ 1 file changed, 14 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/pinctrl/sunxi/pinctrl-sunxi.c b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+index b6c901f1..039472b8 100644
+--- a/drivers/pinctrl/sunxi/pinctrl-sunxi.c
++++ b/drivers/pinctrl/sunxi/pinctrl-sunxi.c
+@@ -38,6 +38,13 @@ struct sunxi_pinctrl_desc {
+ 
+ struct sunxi_pinctrl_plat {
+ 	void __iomem *base;
++	/*
++	 * Banks are not always the same distance apart on the same SoC: the
++	 * A733's main controller spaces them 0x80 bytes apart while its R
++	 * controller keeps the older 0x30 spacing. Everywhere else the two
++	 * strides are defined to the same value, so this costs nothing there.
++	 */
++	u32 bank_size;
+ };
+ 
+ static int sunxi_pinctrl_get_pins_count(struct udevice *dev)
+@@ -88,7 +95,7 @@ static int sunxi_pinctrl_pinmux_set(struct udevice *dev, uint pin_selector,
+ 	      sunxi_pinctrl_get_function_name(dev, func_selector),
+ 	      desc->functions[func_selector].mux);
+ 
+-	sunxi_gpio_set_cfgbank(plat->base + bank * SUNXI_PINCTRL_BANK_SIZE,
++	sunxi_gpio_set_cfgbank(plat->base + bank * plat->bank_size,
+ 			       pin, desc->functions[func_selector].mux);
+ 
+ 	return 0;
+@@ -104,7 +111,7 @@ static const struct pinconf_param sunxi_pinctrl_pinconf_params[] = {
+ static int sunxi_pinctrl_pinconf_set_pull(struct sunxi_pinctrl_plat *plat,
+ 					  uint bank, uint pin, uint bias)
+ {
+-	void *regs = plat->base + bank * SUNXI_PINCTRL_BANK_SIZE;
++	void *regs = plat->base + bank * plat->bank_size;
+ 
+ 	sunxi_gpio_set_pull_bank(regs, pin, bias);
+ 
+@@ -114,7 +121,7 @@ static int sunxi_pinctrl_pinconf_set_pull(struct sunxi_pinctrl_plat *plat,
+ static int sunxi_pinctrl_pinconf_set_drive(struct sunxi_pinctrl_plat *plat,
+ 					   uint bank, uint pin, uint drive)
+ {
+-	void *regs = plat->base + bank * SUNXI_PINCTRL_BANK_SIZE;
++	void *regs = plat->base + bank * plat->bank_size;
+ 
+ 	if (drive < 10 || drive > 40)
+ 		return -EINVAL;
+@@ -150,7 +157,7 @@ static int sunxi_pinctrl_get_pin_muxing(struct udevice *dev, uint pin_selector,
+ 	struct sunxi_pinctrl_plat *plat = dev_get_plat(dev);
+ 	int bank = pin_selector / SUNXI_GPIOS_PER_BANK;
+ 	int pin	 = pin_selector % SUNXI_GPIOS_PER_BANK;
+-	int mux  = sunxi_gpio_get_cfgbank(plat->base + bank * SUNXI_PINCTRL_BANK_SIZE, pin);
++	int mux  = sunxi_gpio_get_cfgbank(plat->base + bank * plat->bank_size, pin);
+ 
+ 	switch (mux) {
+ 	case SUNXI_GPIO_INPUT:
+@@ -197,6 +204,8 @@ static int sunxi_pinctrl_bind(struct udevice *dev)
+ 	dev_set_priv(dev, desc);
+ 
+ 	plat->base = dev_read_addr_ptr(dev) + desc->pio_offset;
++	plat->bank_size = desc->first_bank >= SUNXI_GPIO_L ?
++			  SUNXI_R_PINCTRL_BANK_SIZE : SUNXI_PINCTRL_BANK_SIZE;
+ 
+ 	ret = device_bind_driver_to_node(dev, "gpio_sunxi", dev->name,
+ 					 dev_ofnode(dev), &gpio_dev);
+@@ -208,7 +217,7 @@ static int sunxi_pinctrl_bind(struct udevice *dev)
+ 		if (!gpio_plat)
+ 			return -ENOMEM;
+ 
+-		gpio_plat->regs = plat->base + i * SUNXI_PINCTRL_BANK_SIZE;
++		gpio_plat->regs = plat->base + i * plat->bank_size;
+ 		gpio_plat->bank_name[0] = 'P';
+ 		gpio_plat->bank_name[1] = 'A' + desc->first_bank + i;
+ 		gpio_plat->bank_name[2] = '\0';
+-- 
+2.55.0
+
