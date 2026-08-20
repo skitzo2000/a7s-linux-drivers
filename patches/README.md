@@ -3,7 +3,7 @@
 Kernel patches against the Allwinner BSP tree (`NickAlilovic/allwinner-bsp`, branch
 `linux-6.18.z`, which mounts at `bsp/` inside the kernel source).
 
-`0001` is a power fix and stands alone. `0100`–`0110` are the DisplayPort-over-USB-C series and
+`0001` is a power fix and stands alone. `0100`–`0111` are the DisplayPort-over-USB-C series and
 apply in order. All of them are `-p1` from the kernel source root, so the whole directory drops in
 as one set.
 
@@ -19,16 +19,24 @@ or voltage. Pin the clock anywhere and the board runs a full 8-core load indefin
 under-load reboots and the thermal-throttle crashes were all this one bug (a throttle *is* a
 frequency change). Verified on-board.
 
-## 0100–0110 — DisplayPort over USB-C
+## 0100–0111 — DisplayPort over USB-C
 
 **Status: working.** Cold boot with the cable already in, no debug knobs, no manual
-`echo detect`, survives reboot. Verified 2026-08-19 on a Pluggable UD-ULTC4K dock's native
-DP-alt output driving a 2560×1440 monitor.
+`echo detect`, survives reboot, and survives unplug/replug. Verified 2026-08-19 on a
+Pluggable UD-ULTC4K dock's native DP-alt output driving a 2560×1440 monitor (pin D,
+2 lanes DP + USB3), and on an Elecrow CrowView Note at 1920×1080@60 (pin C, 4-lane
+DP-only). Both typec-DP layouts are covered.
+
+The CrowView is worth knowing about: it impersonates a Samsung DeX Station
+(`0x04e8:0xa020`) and copies its DP capability VDO `0x00000405` verbatim. A real DeX
+Station has USB 2.0 ports only, so that VDO advertises 4-lane DP with
+`DFP_D_PIN_ASSIGN = 0x04` and `DP_CAP_RECEPTACLE` clear — pin C is the *only*
+assignment such a sink offers, and USB3 can never be up alongside video.
 
 | Patch | What |
 |---|---|
 | `0100-dp-combophy-dp-only-bringup-orientation-aux-pad.patch` | Bring the combo PHY up for the 4-lane DP-only pin C/E layout, latch orientation before the code that reads it, drive the AUX pad |
-| `0101-dp-trilinear-aux-clkdiv-and-pad-direction.patch` | `AUX_CLOCK_DIVIDER` is the APB clock in MHz (`clk_bus_edp` = 26), and AUX is half-duplex so the pad direction must be driven per transaction |
+| `0101-dp-trilinear-aux-clkdiv-and-pad-direction.patch` | `AUX_CLOCK_DIVIDER` is the APB clock in MHz — measured 200, *not* the 26 MHz `clk_bus_edp`; the register reads `0xc8` on a working link. AUX is half-duplex, so the pad direction must be driven per transaction |
 | `0102-dp-edp-reinit-phy-before-aux-retry-and-quiet-detect.patch` | Recover the PHY and controller before an AUX retry; stop logging connector detect at info level (~27k lines/boot) |
 | `0103-dp-dts-a7s-enable-aux-dc-bias-gpios.patch` | Wire up the PL10/PL11 AUX DC-bias GPIOs the vendor DTS leaves commented out |
 | `0104-dp-a7s-typec-altmode-no-hpd-lifecycle.patch` | Opt-in lifecycle for boards with no usable physical HPD pin |
@@ -38,6 +46,7 @@ DP-alt output driving a 2560×1440 monitor.
 | `0108-dp-edp-link-training-fallback.patch` | Bounded lane/rate step-down when training fails, instead of training once and giving up |
 | `0109-dp-combophy-gate-software-hpd-on-dp-status.patch` | Require the real `DP_STATUS` HPD bit, not just "are we in a DP alt mode state" — it was firing ~230 ms early |
 | `0110-dp-edp-adopt-already-connected-sink-at-bind.patch` | The sink extcon notifier is edge-only; read the level at bind so a cable already plugged at power-on is seen |
+| `0111-dp-drm-rearm-mode-monitor-on-hotplug.patch` | The boot mode monitor is one-shot, so its single commit was the only modeset the driver ever made — re-arm it on hot-plug and force a real off→on so the encoder actually re-enables |
 
 ### What this turned up
 
