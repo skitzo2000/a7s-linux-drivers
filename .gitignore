@@ -45,3 +45,6 @@ patches/0008-*.patch
 # superseded by the combined sun60i-a733-cubie-a7s-dp.dts
 overlays/sun60i-a733-typec-dp-altmode-svid.dts
 overlays/sun60i-a733-typec-dp-aux-bias.dts
+
+# local Claude Code state — settings.local.json and lock files, never publish
+.claude/
