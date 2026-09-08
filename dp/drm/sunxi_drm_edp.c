@@ -478,6 +478,14 @@ static void edp_hotplugin_proc(struct sunxi_drm_edp *drm_edp)
 		desc->plugin(drm_edp);
 
 	drm_kms_helper_hotplug_event(drm_edp->sdrm.drm_dev);
+
+	/* drm_kms_helper_hotplug_event() only tells userspace. On a console-only
+	 * system there is no DRM client and no DRM fbdev to answer it, so the
+	 * boot-time mode monitor is the only thing that ever commits a mode -
+	 * and it disarms itself after that first commit. Put it back to work,
+	 * otherwise the link comes all the way back up and the panel stays dark.
+	 */
+	sunxi_drm_restart_mode_monitor(drm_edp->sdrm.drm_dev);
 }
 
 static void edp_hotplugout_proc(struct sunxi_drm_edp *drm_edp)

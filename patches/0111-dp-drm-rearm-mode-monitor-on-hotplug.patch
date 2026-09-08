@@ -1,0 +1,142 @@
+drm: sunxi: re-arm the mode monitor so DP hot-plug restores the display
+
+The boot-time mode monitor is one-shot: the first time it sees a connected
+sink it commits a mode, clears is_monitoring, drops its connector reference
+and returns without rescheduling. That single commit is the only modeset this
+driver ever performs on its own.
+
+Nothing covers a re-plug. edp_hotplugin_proc() calls
+drm_kms_helper_hotplug_event(), which only notifies userspace, and a
+console-only system has no DRM client and no DRM fbdev listening. So on
+unplug/replug the USB-C side renegotiates perfectly - alt mode, HPD, DPCD,
+EDID and link training all come back, TR_AUX_STATUS is clean and the driver's
+own hotplug attribute reads Plugin - while the panel stays dark forever.
+
+Re-arm the monitor from the hot-plug-in path, and force a full modeset in
+commit_init_connecting(). The forced modeset is required, not cosmetic:
+drm_dp_output_plugout() tears the DP hardware down from the "edp detect"
+kthread outside the atomic machinery, so DRM still believes the CRTC is on
+and driving this mode. Without it the commit computes "nothing changed" and
+skips ->atomic_disable/->atomic_enable, which is exactly the state an
+explicit modetest -s lands in: mode set, VIDEO-OUT still 0, screen dark.
+
+Signed-off-by: Paul Goldsmith <goldfish.paul@gmail.com>
+---
+--- a/bsp/drivers/drm/sunxi_drm_drv.h
++++ b/bsp/drivers/drm/sunxi_drm_drv.h
+@@ -101,6 +101,7 @@
+ int sunxi_drm_get_device_max_fps(struct drm_device *drm);
+ unsigned int sunxi_drm_get_de_max_freq(struct drm_device *drm);
+ void sunxi_drm_signal_sw_enable_done(struct drm_crtc *crtc);
++void sunxi_drm_restart_mode_monitor(struct drm_device *drm);
+ struct proc_dir_entry *sunxi_drm_get_procfs_dir(void);
+ 
+ #endif
+--- a/bsp/drivers/drm/sunxi_drm_drv.c
++++ b/bsp/drivers/drm/sunxi_drm_drv.c
+@@ -611,6 +611,24 @@
+ 		}
+ 
+ 		crtc_state->active = true;
++
++		/* Force a full modeset even when the CRTC is already active with
++		 * this mode.
++		 *
++		 * On the boot path the CRTC is off, so this changes nothing. On the
++		 * hot-plug path it is the whole point: the DP hardware is torn down
++		 * by drm_dp_output_plugout() from the "edp detect" kthread, outside
++		 * the atomic machinery, so DRM still believes the CRTC is on and
++		 * driving this mode. Without a forced modeset the commit below
++		 * computes "nothing changed", skips ->atomic_disable/->atomic_enable
++		 * entirely, and the output is never re-enabled - the display stays
++		 * dark with a perfectly trained link behind it.
++		 *
++		 * drm_atomic_helper_check_modeset() only ever ORs mode_changed in,
++		 * so setting it here survives the check phase.
++		 */
++		crtc_state->mode_changed = true;
++
+ 		new_conn_state = drm_atomic_get_connector_state(state, c->connector);
+ 		if (IS_ERR(new_conn_state)) {
+ 			ret = PTR_ERR(new_conn_state);
+@@ -851,6 +869,63 @@
+ 	schedule_delayed_work(&monitor->work, 0);
+ }
+ 
++/* Re-arm the boot-time mode monitor after a hot-plug.
++ *
++ * sunxi_drm_mode_monitor_work_handler() is one-shot by construction: the first
++ * time it sees a connected sink it commits a mode, clears is_monitoring, drops
++ * its connector reference and returns without rescheduling. That is fine for
++ * the boot hand-off it was written for, but it means the single commit made at
++ * boot is the only modeset this driver will ever perform on its own.
++ *
++ * Nothing else picks up the slack on a re-plug. edp_hotplugin_proc() calls
++ * drm_kms_helper_hotplug_event(), which only notifies userspace, and on a
++ * console-only system there is no DRM client and no DRM fbdev listening. So
++ * the USB-C side renegotiates perfectly - alt mode, HPD, DPCD, EDID, link
++ * training all come back - and the panel stays dark forever.
++ *
++ * Re-arming here puts the monitor back in the polling state it had at boot.
++ * It re-probes with ->detect() every check_interval_ms, so it does not care
++ * that connector->status is a stale cached value at this point.
++ */
++void sunxi_drm_restart_mode_monitor(struct drm_device *drm)
++{
++	struct sunxi_drm_private *pri;
++	struct sunxi_mode_monitor *monitor;
++	struct sunxi_init_connecting *c, *tmp;
++
++	if (!drm)
++		return;
++
++	pri = to_sunxi_drm_private(drm);
++	if (!pri)
++		return;
++
++	monitor = pri->mode_monitor;
++	if (!monitor || !monitor->connector || !monitor->priv)
++		return;
++
++	/* Already looking - the pending work will pick the sink up. */
++	if (monitor->is_monitoring)
++		return;
++
++	/* Drop whatever the previous run left on the connecting list. Nothing
++	 * frees these entries, and commit_init_connecting() walks the whole
++	 * list, so re-arming without draining would commit the stale entry
++	 * again alongside the fresh one.
++	 */
++	list_for_each_entry_safe(c, tmp, &monitor->priv->connecting_head, list) {
++		list_del(&c->list);
++		kfree(c);
++	}
++
++	/* Balances the drm_connector_put() the handler did when it disarmed. */
++	drm_connector_get(monitor->connector);
++	monitor->is_monitoring = true;
++
++	sunxi_drm_start_mode_monitor(monitor);
++}
++EXPORT_SYMBOL_GPL(sunxi_drm_restart_mode_monitor);
++
+ static int init_connecting(struct drm_device *drm, struct drm_crtc **crtcs, unsigned int crtc_cnt,
+ 				struct drm_connector **connectors, unsigned int connector_cnt)
+ {
+--- a/bsp/drivers/drm/sunxi_drm_edp.c
++++ b/bsp/drivers/drm/sunxi_drm_edp.c
+@@ -478,6 +478,14 @@
+ 		desc->plugin(drm_edp);
+ 
+ 	drm_kms_helper_hotplug_event(drm_edp->sdrm.drm_dev);
++
++	/* drm_kms_helper_hotplug_event() only tells userspace. On a console-only
++	 * system there is no DRM client and no DRM fbdev to answer it, so the
++	 * boot-time mode monitor is the only thing that ever commits a mode -
++	 * and it disarms itself after that first commit. Put it back to work,
++	 * otherwise the link comes all the way back up and the panel stays dark.
++	 */
++	sunxi_drm_restart_mode_monitor(drm_edp->sdrm.drm_dev);
+ }
+ 
+ static void edp_hotplugout_proc(struct sunxi_drm_edp *drm_edp)
