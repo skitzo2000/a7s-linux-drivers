@@ -19,6 +19,7 @@ for that piece says so.
 | [`gmac/`](gmac/) | `dwmac-sun60iw2` — stmmac glue for the GMAC-210, ported to 6.18 | eth0 at 1 Gbps, DHCP, clean counters |
 | [`npu-vipcore/`](npu-vipcore/) | VIP9000 NPU driver ported to 6.18 | `/dev/vipcore` live; userspace runtime still missing |
 | [`aic8800/`](aic8800/) | AIC8800D80 WiFi/BT tree + two fixes | both fixes verified on-board |
+| [`rtl-sdr/`](rtl-sdr/) | DVB-USB v2 + RTL28xxU from v6.18.19, the two modules the kernel config leaves out — an RTL-SDR becomes `/dev/swradio0` | verified on-board: IQ at 100 / 434 / 915 MHz |
 | [`dp/`](dp/) | DisplayPort-over-USB-C — replacement sources for the three BSP drivers on the DP path | 2560×1440, automatic on boot, survives reboot |
 | [`patches/`](patches/) | AXP8191 CPU-rail fix, plus the DP series `0100`–`0110` | both verified on-board; need a full Image rebuild |
 | [`overlays/`](overlays/) | Device-tree overlays for the cyberdeck shield | in daily use |
@@ -51,6 +52,29 @@ It builds out of a temp copy so the repo stays clean, and it skips anything alre
 `/lib/modules/$(uname -r)/extra/`. Delete the `.ko` there to force a rebuild.
 
 Each directory also has a plain `make` path if you'd rather do one at a time. See its README.
+
+### The whole kernel
+
+To get all of this *into* the kernel packages instead of loading it beside them — the patch
+set, the aic8800 monitor-mode fix, the RTL-SDR config — stage the repo into an Armbian build
+checkout (NickAlilovic/build, branch `Radxa-mainline-WIP-a7s`) and build:
+
+```sh
+./kernel/stage-userpatches.sh ~/path/to/armbian-build
+cd ~/path/to/armbian-build
+DOCKER_EXTRA_ARGS="--network=host" ./compile.sh kernel BOARD=radxa-cubie-a7s BRANCH=edge KERNEL_CONFIGURE=no PREFER_DOCKER=yes
+```
+
+`output/debs/linux-{image,headers,dtb}-edge-sun60iw2_*.deb` come out; the `P<hash>` field in
+their names hashes the patch set, so a staging change shows up in the file name. Install on a
+board with `apt install ./linux-image-…deb ./linux-dtb-…deb ./linux-headers-…deb` and reboot.
+The out-of-tree modules in `extra/` (vipcore, GMAC glue) still need `build-modules.sh`; the
+DVB-USB pair is then in-tree and its copy in `extra/` can go. `kernel/install-on-board.sh`
+does the install (a reinstall from apt's view — same release string) and that cleanup.
+
+Built packages are published as releases here: `kernel-6.18.19-Pacdb` (2026-09-08) is what
+the cluster's three boards run — 16 minutes in the Armbian container on a 16-core host, all
+27 patches applied clean.
 
 ## DisplayPort
 

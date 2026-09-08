@@ -7,6 +7,8 @@
 #
 #   vipcore.ko          NPU / VIP9000 -> /dev/vipcore   (npu-vipcore/vipcore)
 #   dwmac-sun60iw2.ko   GMAC-210 ethernet glue          (gmac)
+#   dvb_usb_v2.ko +     DVB-USB v2 framework + RTL28xxU: an RTL-SDR dongle
+#   dvb-usb-rtl28xxu.ko   becomes /dev/swradio0          (rtl-sdr/src)
 #
 # aic8800 is NOT built here — WiFi and BT ship in-tree in the vendor kernel,
 # and building them out-of-tree would shadow the working ones. See aic8800/.
@@ -40,12 +42,14 @@ command -v make >/dev/null 2>&1 || {
 mkdir -p "$DEST"
 built=0; failed=""
 
-build_one() {  # build_one <name> <source dir> <produced .ko>
-  local name="$1" src="$2" ko="$3"
+build_one() {  # build_one <name> <source dir> <produced .ko> [more .ko …]
+  local name="$1" src="$2"; shift 2
+  local kos="$*" ko="$1" have=1 k
   if [ ! -d "$src" ]; then
     warn "$name: source not found at $src"; failed="$failed $name"; return
   fi
-  if [ -f "$DEST/$ko" ]; then
+  for k in $kos; do [ -f "$DEST/$k" ] || have=0; done
+  if [ "$have" = 1 ]; then
     say "$name already installed — skipping (rm $DEST/$ko to force)"
     built=$((built + 1)); return
   fi
@@ -54,13 +58,16 @@ build_one() {  # build_one <name> <source dir> <produced .ko>
   local work; work="$(mktemp -d)"
   cp -a "$src"/. "$work"/
   if make -C "$KDIR" M="$work" modules >"$work/build.log" 2>&1; then
-    if [ -f "$work/$ko" ]; then
-      install -m 0644 "$work/$ko" "$DEST/$ko"
-      say "  installed $DEST/$ko"
-      built=$((built + 1))
-    else
-      warn "  build reported success but $ko was not produced"; failed="$failed $name"
-    fi
+    local ok=1
+    for k in $kos; do
+      if [ -f "$work/$k" ]; then
+        install -m 0644 "$work/$k" "$DEST/$k"
+        say "  installed $DEST/$k"
+      else
+        warn "  build reported success but $k was not produced"; ok=0
+      fi
+    done
+    if [ "$ok" = 1 ]; then built=$((built + 1)); else failed="$failed $name"; fi
   else
     warn "  build FAILED — tail of the log:"
     tail -12 "$work/build.log" | sed 's/^/    /'
@@ -71,6 +78,7 @@ build_one() {  # build_one <name> <source dir> <produced .ko>
 
 build_one vipcore          "$REPO/npu-vipcore/vipcore" vipcore.ko
 build_one dwmac-sun60iw2   "$REPO/gmac"                dwmac-sun60iw2.ko
+build_one rtl-sdr          "$REPO/rtl-sdr/src"         dvb_usb_v2.ko dvb-usb-rtl28xxu.ko
 
 say "running depmod"
 depmod -a "$KV" || warn "depmod failed"
