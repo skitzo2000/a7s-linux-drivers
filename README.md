@@ -53,6 +53,24 @@ It builds out of a temp copy so the repo stays clean, and it skips anything alre
 
 Each directory also has a plain `make` path if you'd rather do one at a time. See its README.
 
+### The whole kernel
+
+To get all of this *into* the kernel packages instead of loading it beside them — the patch
+set, the aic8800 monitor-mode fix, the RTL-SDR config — stage the repo into an Armbian build
+checkout (NickAlilovic/build, branch `Radxa-mainline-WIP-a7s`) and build:
+
+```sh
+./kernel/stage-userpatches.sh ~/path/to/armbian-build
+cd ~/path/to/armbian-build
+DOCKER_EXTRA_ARGS="--network=host" ./compile.sh kernel BOARD=radxa-cubie-a7s BRANCH=edge KERNEL_CONFIGURE=no PREFER_DOCKER=yes
+```
+
+`output/debs/linux-{image,headers,dtb}-edge-sun60iw2_*.deb` come out; the `P<hash>` field in
+their names hashes the patch set, so a staging change shows up in the file name. Install on a
+board with `apt install ./linux-image-…deb ./linux-dtb-…deb ./linux-headers-…deb` and reboot.
+The out-of-tree modules in `extra/` (vipcore, GMAC glue) still need `build-modules.sh`; the
+DVB-USB pair is then in-tree and its copy in `extra/` can go.
+
 ## DisplayPort
 
 The A7S has **no HDMI**. Every pixel leaves this board over USB-C DisplayPort alt mode, so this is

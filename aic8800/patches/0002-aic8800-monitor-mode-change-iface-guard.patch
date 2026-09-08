@@ -1,0 +1,42 @@
+From: cybercluster <noreply@thenortonfamily.net>
+Subject: [PATCH] aic8800: let wlan0 switch to monitor mode (change_iface guard tested the wrong vif)
+
+rwnx_cfg80211_change_iface() refused every managed->monitor switch with -EIO
+because its MON_DATA guard checked RWNX_VIF_TYPE(vif) instead of vif_el, and
+the driver's own P2P device vif is always in the list. Test the other vif;
+skip monitor / P2P-device / down vifs. Verified on a7s-3 (radiotap capture on
+channels 1-165, hand-back to managed works). a7s-linux-drivers PR #3.
+
+--- a/bsp/drivers/net/wireless/aic8800/usb/aic8800_fdrv/rwnx_main.c	2026-09-07 22:24:51.212229925 -0400
++++ b/bsp/drivers/net/wireless/aic8800/usb/aic8800_fdrv/rwnx_main.c	2026-09-07 22:24:51.229476693 -0400
+@@ -2442,13 +2442,23 @@
+        (RWNX_VIF_TYPE(vif) != NL80211_IFTYPE_MONITOR)) {
+         struct rwnx_vif *vif_el;
+         list_for_each_entry(vif_el, &rwnx_hw->vifs, list) {
+-            // Check if data interface already exists
+-            if ((vif_el != vif) &&
+-               (RWNX_VIF_TYPE(vif) != NL80211_IFTYPE_MONITOR)) {
+-                wiphy_err(rwnx_hw->wiphy,
+-                        "Monitor+Data interface support (MON_DATA) disabled\n");
+-                return -EIO;
+-            }
++            // Without MON_DATA firmware support a monitor interface cannot
++            // coexist with a DATA interface. Refuse only when ANOTHER
++            // interface is up and carries data (STA/AP/mesh/P2P client or GO).
++            // The P2P device wdev has no data path, and a down interface
++            // carries nothing. The original test looked at `vif` — the
++            // interface being changed — instead of `vif_el`, so the driver's
++            // own P2P device entry made every switch to monitor fail with -EIO
++            // (a7s, 2026-09-07).
++            if (vif_el == vif || !vif_el->up)
++                continue;
++            if (RWNX_VIF_TYPE(vif_el) == NL80211_IFTYPE_MONITOR ||
++                RWNX_VIF_TYPE(vif_el) == NL80211_IFTYPE_P2P_DEVICE)
++                continue;
++            wiphy_err(rwnx_hw->wiphy,
++                    "Monitor+Data interface support (MON_DATA) disabled: %s is up\n",
++                    vif_el->ndev ? vif_el->ndev->name : "an interface");
++            return -EIO;
+         }
+     }
+ #endif

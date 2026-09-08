@@ -137,6 +137,10 @@ nmcli dev set wlan0 managed yes` hands the radio back. Still true: monitor and d
 cannot coexist (the firmware has no MON_DATA), so a board in monitor mode has no Wi-Fi
 uplink — use the backbone.
 
+As a kernel patch: [`patches/0002-aic8800-monitor-mode-change-iface-guard.patch`](patches/0002-aic8800-monitor-mode-change-iface-guard.patch),
+`-p1` from the kernel source root against the `linux-6.18.z` BSP copy (`bsp/drivers/net/wireless/aic8800/usb/aic8800_fdrv/rwnx_main.c`);
+`kernel/stage-userpatches.sh` puts it into an Armbian build.
+
 Build note: `PWD ?= $(shell pwd)` in the fdrv Makefile inherits an exported `PWD`, so
 run `make` from inside `driver/usb/aic8800_fdrv` (or pass `PWD=$(pwd)`), and remember
 `sudo` resets `HOME`.
