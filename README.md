@@ -69,7 +69,12 @@ DOCKER_EXTRA_ARGS="--network=host" ./compile.sh kernel BOARD=radxa-cubie-a7s BRA
 their names hashes the patch set, so a staging change shows up in the file name. Install on a
 board with `apt install ./linux-image-…deb ./linux-dtb-…deb ./linux-headers-…deb` and reboot.
 The out-of-tree modules in `extra/` (vipcore, GMAC glue) still need `build-modules.sh`; the
-DVB-USB pair is then in-tree and its copy in `extra/` can go.
+DVB-USB pair is then in-tree and its copy in `extra/` can go. `kernel/install-on-board.sh`
+does the install (a reinstall from apt's view — same release string) and that cleanup.
+
+Built packages are published as releases here: `kernel-6.18.19-Pacdb` (2026-09-08) is what
+the cluster's three boards run — 16 minutes in the Armbian container on a 16-core host, all
+27 patches applied clean.
 
 ## DisplayPort
 
