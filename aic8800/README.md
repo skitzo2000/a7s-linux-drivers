@@ -110,3 +110,33 @@ whose USB is shared with Bluetooth, that's a change in the right direction.
 
 The full writeup, including everything I checked before calling it — is in
 [`USERCONFIG-PATH.md`](USERCONFIG-PATH.md).
+
+## 3. Monitor mode is refused (`set type monitor` → -EIO)
+
+The phy advertises `monitor` and every 5 GHz channel, and NetworkManager leaves the
+interface alone once it is unmanaged — yet `iw dev wlan0 set type monitor` fails with
+`Operation not permitted`/`-EIO` and dmesg says `Monitor+Data interface support
+(MON_DATA) disabled`. Adding a second interface (`iw phy phy0 interface add mon0 type
+monitor`) fails too (`-22`, the interface combinations exclude it), so the only way to a
+monitor interface is to switch `wlan0` itself.
+
+The guard in `rwnx_cfg80211_change_iface()` (rwnx_main.c) walks the vif list looking
+for *another* data interface but tests `vif` — the interface being changed — instead of
+`vif_el`. The driver's own P2P device entry is always in that list, so the loop refuses
+every time. The fix tests `vif_el`, and skips vifs that are monitor, the P2P device
+(no data path) or not up. With it:
+
+```sh
+nmcli dev set wlan0 managed no          # NM re-manages a NEW netdev after a driver reload: do this after the modules are in
+ip link set wlan0 down && iw dev wlan0 set type monitor && ip link set wlan0 up
+iw dev wlan0 set freq 5240              # radiotap frames on 2.4 and 5 GHz, channels 1–165 (a7s-3, 2026-09-08)
+```
+
+`ip link set wlan0 down && iw dev wlan0 set type managed && ip link set wlan0 up &&
+nmcli dev set wlan0 managed yes` hands the radio back. Still true: monitor and data
+cannot coexist (the firmware has no MON_DATA), so a board in monitor mode has no Wi-Fi
+uplink — use the backbone.
+
+Build note: `PWD ?= $(shell pwd)` in the fdrv Makefile inherits an exported `PWD`, so
+run `make` from inside `driver/usb/aic8800_fdrv` (or pass `PWD=$(pwd)`), and remember
+`sudo` resets `HOME`.
