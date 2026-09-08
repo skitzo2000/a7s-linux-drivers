@@ -19,6 +19,7 @@ for that piece says so.
 | [`gmac/`](gmac/) | `dwmac-sun60iw2` — stmmac glue for the GMAC-210, ported to 6.18 | eth0 at 1 Gbps, DHCP, clean counters |
 | [`npu-vipcore/`](npu-vipcore/) | VIP9000 NPU driver ported to 6.18 | `/dev/vipcore` live; userspace runtime still missing |
 | [`aic8800/`](aic8800/) | AIC8800D80 WiFi/BT tree + two fixes | both fixes verified on-board |
+| [`rtl-sdr/`](rtl-sdr/) | DVB-USB v2 + RTL28xxU from v6.18.19, the two modules the kernel config leaves out — an RTL-SDR becomes `/dev/swradio0` | verified on-board: IQ at 100 / 434 / 915 MHz |
 | [`dp/`](dp/) | DisplayPort-over-USB-C — replacement sources for the three BSP drivers on the DP path | 2560×1440, automatic on boot, survives reboot |
 | [`patches/`](patches/) | AXP8191 CPU-rail fix, plus the DP series `0100`–`0110` | both verified on-board; need a full Image rebuild |
 | [`overlays/`](overlays/) | Device-tree overlays for the cyberdeck shield | in daily use |

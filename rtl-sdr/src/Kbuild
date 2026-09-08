@@ -1,0 +1,12 @@
+# Out-of-tree build of two in-tree drivers the A7S kernel config leaves out
+# (CONFIG_DVB_USB_V2 / CONFIG_DVB_USB_RTL28XXU are "not set"): the DVB-USB v2
+# framework and the Realtek RTL28xxU dongle driver, verbatim from v6.18.19.
+# Everything they call is already in the vendor kernel (dvb-core, rc-core,
+# i2c-mux built in; rtl2832, rtl2832_sdr, r820t and the other demods/tuners
+# as modules), so with these two the dongle becomes /dev/swradio0.
+obj-m += dvb_usb_v2.o dvb-usb-rtl28xxu.o
+dvb_usb_v2-objs := dvb_usb_core.o dvb_usb_urb.o usb_urb.o
+dvb-usb-rtl28xxu-objs := rtl28xxu.o
+# The demod/tuner attach headers normally come from drivers/media/{dvb-frontends,tuners};
+# copies live next to the sources here (the headers package does not ship them).
+ccflags-y := -I$(src) -DCONFIG_DVB_USB_V2_MODULE -DCONFIG_DVB_USB_RTL28XXU_MODULE
